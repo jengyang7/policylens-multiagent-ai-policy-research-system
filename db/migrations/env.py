@@ -12,9 +12,12 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Use the async URL from .env but swap the driver to psycopg (sync) for Alembic
-_db_url = os.environ["DATABASE_URL"].replace(
-    "postgresql+asyncpg://", "postgresql+psycopg://"
+# Use the async URL from .env but swap driver to psycopg (sync) for Alembic.
+# asyncpg uses ssl=require; psycopg uses sslmode=require.
+_db_url = (
+    os.environ["DATABASE_URL"]
+    .replace("postgresql+asyncpg://", "postgresql+psycopg://")
+    .replace("ssl=require", "sslmode=require")
 )
 config.set_main_option("sqlalchemy.url", _db_url)
 

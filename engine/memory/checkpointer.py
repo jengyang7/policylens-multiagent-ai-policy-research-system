@@ -16,8 +16,12 @@ def _conn_string() -> str:
     url = os.environ.get("DATABASE_URL")
     if not url:
         raise RuntimeError("DATABASE_URL environment variable is not set")
-    # asyncpg uses postgresql+asyncpg://, but psycopg (used by checkpointer) needs postgresql://
-    return url.replace("postgresql+asyncpg://", "postgresql://")
+    # asyncpg uses postgresql+asyncpg:// + ssl=require
+    # psycopg (checkpointer) needs postgresql:// + sslmode=require
+    return (
+        url.replace("postgresql+asyncpg://", "postgresql://")
+           .replace("ssl=require", "sslmode=require")
+    )
 
 
 @asynccontextmanager
