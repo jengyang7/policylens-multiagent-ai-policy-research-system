@@ -13,10 +13,16 @@ from engine.state import SubtaskFinding
 _PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        "You are a research summarizer. Given a list of raw findings from parallel "
-        "research subagents, produce a compact, factual summary that preserves every "
-        "distinct claim and its source URL. Group by theme. Keep each point concise. "
-        "Do not add information not present in the findings.",
+        "You are preparing research notes for an analyst who will write a deep, "
+        "synthesized report — not a final summary. Given a list of raw findings from "
+        "parallel research subagents, produce a compact but information-dense summary "
+        "that:\n"
+        "- preserves every distinct claim, its exact figures/numbers, and its source URL\n"
+        "- groups findings by theme\n"
+        "- when multiple findings address the same topic, groups them together and "
+        "notes where they agree, where they differ, and by roughly how much\n"
+        "Do not add information not present in the findings, and do not drop numeric "
+        "detail or source attribution for the sake of brevity.",
     ),
     ("human", "Findings:\n{findings_text}"),
 ])

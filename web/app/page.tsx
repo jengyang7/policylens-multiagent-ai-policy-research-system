@@ -325,7 +325,7 @@ export default function Home() {
 
   async function submitClarification() {
     if (clarifyAnswers.some(a => !a.trim())) return;
-    setPhase('querying');
+    setPhase('researching');
     addLog('clarify', 'Answers submitted');
     try {
       const res = await fetch(`${API}/runs/${runId}/resume`, {
@@ -646,8 +646,8 @@ export default function Home() {
                   )}
                 </div>
 
-                {/* Subtask cards */}
-                {subtasks.length > 0 && (
+                {/* Subtask cards — hidden once the final report is ready */}
+                {subtasks.length > 0 && !(showReport && report) && (
                   <div className="px-8 pt-3 pb-4 space-y-2">
                     <p className="text-[11px] uppercase tracking-wide text-gray-400 font-medium mb-3">
                       Research Plan
