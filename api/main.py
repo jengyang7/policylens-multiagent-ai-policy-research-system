@@ -23,8 +23,10 @@ from sse_starlette.sse import EventSourceResponse
 
 from db.models import ResearchRun
 from engine.memory.checkpointer import get_checkpointer
+from engine.models import LEAD_MODEL, LEAD_MODEL_OPTIONS, SUBAGENT_MODEL, estimate_cost_usd
 from engine.nodes.chat import answer_followup
 from engine.orchestrator import build_graph
+from engine.state import TokenUsage
 
 load_dotenv()
 
@@ -97,6 +99,7 @@ async def _unhandled(request: Request, exc: Exception) -> JSONResponse:
 
 class ResearchRequest(BaseModel):
     query: str
+    model: str | None = None
 
 
 class ResumeRequest(BaseModel):
@@ -145,11 +148,12 @@ async def _stream_graph(
       subtask_done        {type, question, findings_count}
       report              {type, content, run_id}
       clarification_needed {type, run_id, questions: [...]}
-      done                {type, run_id}
+      done                {type, run_id, usage: {...}}
       error               {type, message}
     """
     assert _graph is not None
     config = {"configurable": {"thread_id": run_id}}
+    start_time = time.time()
 
     yield _evt({"type": "started", "run_id": run_id})
 
@@ -169,7 +173,9 @@ async def _stream_graph(
 
                 elif node_name == "subagent":
                     findings: list[dict] = node_output.get("findings", [])  # type: ignore[union-attr]
-                    question = findings[0]["subtask"] if findings else ""
+                    processed: list[str] = node_output.get("processed_subtasks", [])
+                    fallback = findings[0]["subtask"] if findings else ""
+                    question = processed[0] if processed else fallback
                     sources = list({
                         f["citation_url"] for f in findings if f.get("citation_url")
                     })
@@ -208,9 +214,22 @@ async def _stream_graph(
                 })
                 return
 
-        # Graph completed normally.
-        await _update_run(run_id, "done", finished_at=datetime.now(timezone.utc))
-        yield _evt({"type": "done", "run_id": run_id})
+        # Graph completed normally — summarize token usage/cost/time for the UI.
+        token_usage: list[TokenUsage] = snapshot.values.get("token_usage", [])
+        lead_model = snapshot.values.get("lead_model", LEAD_MODEL)
+        usage = {
+            "lead_model": lead_model,
+            "subagent_model": SUBAGENT_MODEL,
+            "input_tokens": sum(u["input_tokens"] for u in token_usage),
+            "output_tokens": sum(u["output_tokens"] for u in token_usage),
+            "cached_tokens": sum(u["cached_tokens"] for u in token_usage),
+            "cost_usd": round(estimate_cost_usd(token_usage), 4),
+            "elapsed_seconds": round(time.time() - start_time, 1),
+        }
+        usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
+
+        await _update_run(run_id, "done", finished_at=datetime.now(timezone.utc), stats=usage)
+        yield _evt({"type": "done", "run_id": run_id, "usage": usage})
 
     except Exception as exc:
         await _update_run(run_id, "failed")
@@ -221,9 +240,24 @@ async def _stream_graph(
 # Endpoints
 # ---------------------------------------------------------------------------
 
+@app.get("/models")
+async def list_models() -> dict[str, object]:
+    """Lead models selectable on the New Research page, plus the default."""
+    return {
+        "default": LEAD_MODEL,
+        "options": [
+            {"id": model_id, **meta} for model_id, meta in LEAD_MODEL_OPTIONS.items()
+        ],
+    }
+
+
 @app.post("/research")
 async def start_research(body: ResearchRequest) -> EventSourceResponse:
     assert _session_factory is not None
+
+    if body.model is not None and body.model not in LEAD_MODEL_OPTIONS:
+        raise HTTPException(400, f"Unknown model: {body.model}")
+    lead_model = body.model or LEAD_MODEL
 
     run_id = str(uuid.uuid4())
     async with _session_factory() as session:
@@ -233,6 +267,7 @@ async def start_research(body: ResearchRequest) -> EventSourceResponse:
     initial_state: dict[str, object] = {
         "run_id": run_id,
         "query": body.query,
+        "lead_model": lead_model,
         "clarification_questions": [],
         "clarification_options": [],
         "clarifications": [],
@@ -242,6 +277,8 @@ async def start_research(body: ResearchRequest) -> EventSourceResponse:
         "summary": "",
         "report": "",
         "messages": [],
+        "token_usage": [],
+        "processed_subtasks": [],
     }
     return EventSourceResponse(_stream_graph(run_id, initial_state))
 

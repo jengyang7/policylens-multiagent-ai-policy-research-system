@@ -5,9 +5,10 @@ from langchain_openai import ChatOpenAI
 
 from engine.extraction import FindingList
 from engine.models import SUBAGENT_MODEL
-from engine.state import SubagentInput, SubtaskFinding
+from engine.state import SubagentInput, SubtaskFinding, TokenUsage
 from engine.tools.fetch import fetch
 from engine.tools.search import search
+from engine.usage import usage_from_message
 
 _PROMPT = ChatPromptTemplate.from_messages([
     (
@@ -27,7 +28,7 @@ _PROMPT = ChatPromptTemplate.from_messages([
 ])
 
 
-def subagent(state: SubagentInput) -> dict[str, list[SubtaskFinding]]:
+def subagent(state: SubagentInput) -> dict[str, object]:
     """search → fetch → extract validated Findings for one sub-question.
 
     Each Send fan-out invocation handles exactly one subtask. Results are merged
@@ -35,10 +36,13 @@ def subagent(state: SubagentInput) -> dict[str, list[SubtaskFinding]]:
     """
     question = state["question"]
     llm: ChatOpenAI = ChatOpenAI(model=SUBAGENT_MODEL, temperature=0)
-    chain = _PROMPT | llm.with_structured_output(FindingList, method="function_calling")
+    chain = _PROMPT | llm.with_structured_output(
+        FindingList, method="function_calling", include_raw=True
+    )
 
     results = search(question, max_results=4)
     findings: list[SubtaskFinding] = []
+    input_tokens = output_tokens = cached_tokens = 0
 
     for result in results:
         url: str = result.get("url", "")
@@ -51,9 +55,17 @@ def subagent(state: SubagentInput) -> dict[str, list[SubtaskFinding]]:
             continue
 
         try:
-            extracted: FindingList = chain.invoke(  # type: ignore[assignment]
+            raw = chain.invoke(
                 {"question": question, "url": url, "content": content[:6_000]}
             )
+            usage = usage_from_message(raw["raw"], "subagent", SUBAGENT_MODEL)
+            if usage:
+                input_tokens += usage["input_tokens"]
+                output_tokens += usage["output_tokens"]
+                cached_tokens += usage["cached_tokens"]
+            extracted: FindingList | None = raw["parsed"]
+            if extracted is None:
+                continue
             for f in extracted.findings:
                 findings.append(
                     SubtaskFinding(
@@ -67,4 +79,13 @@ def subagent(state: SubagentInput) -> dict[str, list[SubtaskFinding]]:
             # Silently drop unextractable sources; don't let one bad page fail the subtask
             continue
 
-    return {"findings": findings}
+    token_usage: list[TokenUsage] = []
+    if input_tokens or output_tokens:
+        token_usage.append(TokenUsage(
+            node="subagent", model=SUBAGENT_MODEL,
+            input_tokens=input_tokens, output_tokens=output_tokens, cached_tokens=cached_tokens,
+        ))
+
+    # Always record this subtask as processed, even with zero findings, so the
+    # API can mark it "done" in the UI (an empty-findings event has no question).
+    return {"findings": findings, "processed_subtasks": [question], "token_usage": token_usage}

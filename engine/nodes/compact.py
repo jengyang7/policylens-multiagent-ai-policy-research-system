@@ -6,6 +6,7 @@ a compact, context-window-safe input instead of unbounded raw text.
 from __future__ import annotations
 
 from engine.memory.compaction import compact_findings
+from engine.models import LEAD_MODEL
 from engine.state import ResearchState
 
 
@@ -15,6 +16,6 @@ def compact(state: ResearchState) -> dict[str, object]:
     if not findings:
         return {"summary": "(no findings to compact)"}
 
-    summary = compact_findings(findings)  # type: ignore[arg-type]
+    summary, usage = compact_findings(findings, state.get("lead_model", LEAD_MODEL))  # type: ignore[arg-type]
     # Trim raw findings after compaction — the summary replaces them for synthesis
-    return {"summary": summary, "findings": []}
+    return {"summary": summary, "findings": [], "token_usage": [usage] if usage else []}

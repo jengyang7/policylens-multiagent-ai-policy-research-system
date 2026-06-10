@@ -8,7 +8,8 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 
 from engine.models import LEAD_MODEL
-from engine.state import SubtaskFinding
+from engine.state import SubtaskFinding, TokenUsage
+from engine.usage import usage_from_message
 
 _PROMPT = ChatPromptTemplate.from_messages([
     (
@@ -40,10 +41,13 @@ def _format_for_compaction(findings: list[SubtaskFinding]) -> str:
     return "\n\n".join(lines) if lines else "(no findings)"
 
 
-def compact_findings(findings: list[SubtaskFinding]) -> str:
+def compact_findings(
+    findings: list[SubtaskFinding], lead_model: str = LEAD_MODEL
+) -> tuple[str, TokenUsage | None]:
     """Summarize raw findings into a compact string for the synthesizer."""
     findings_text = _format_for_compaction(findings)
-    llm: ChatOpenAI = ChatOpenAI(model=LEAD_MODEL, temperature=0)
+    llm: ChatOpenAI = ChatOpenAI(model=lead_model, temperature=0)
     chain = _PROMPT | llm
     result = chain.invoke({"findings_text": findings_text})
-    return str(result.content)
+    usage = usage_from_message(result, "compact", lead_model)
+    return str(result.content), usage

@@ -22,6 +22,7 @@ from pydantic import BaseModel
 
 from engine.models import LEAD_MODEL
 from engine.state import Clarification, ResearchState
+from engine.usage import usage_from_message
 
 
 class QuestionWithOptions(BaseModel):
@@ -48,6 +49,21 @@ _PROMPT = ChatPromptTemplate.from_messages([
         "e.g. who the research is for, which scope/angle/sub-topic to prioritize "
         "within a broad subject, what time frame to focus on, or which geography "
         "applies when it's not specified and matters.\n\n"
+        "Subject/entity identity check (do this FIRST): if the query is a single "
+        "word, a short name, an acronym, or a term that could plausibly refer to "
+        "more than one distinct real-world entity (a company, product, person, "
+        "place, technology, etc.), and researching the wrong entity would produce "
+        "an irrelevant report, you MUST treat this as ambiguous and ask a question "
+        "to identify which entity is meant — even if the query is very short and "
+        "even if one meaning seems most popular or 'obvious'. List the most likely "
+        "candidate entities as chip options (be specific, e.g. include what each "
+        "one is), plus a final option like 'Something else' or 'General overview "
+        "of all of these'.\n\n"
+        "Example for the query 'Grab':\n"
+        "  question: 'Which \"Grab\" do you mean?'\n"
+        "  options: ['Grab (ride-hailing & delivery super-app)', 'GRAB (the card "
+        "game)', 'A different company/product/person named Grab', 'General "
+        "overview of all of these']\n\n"
         "Time frame is often already implied by the query's phrasing — present-tense "
         "wording like 'is', 'current', or 'latest' (e.g. 'How is the job market "
         "now?') already anchors the research to the current state, so do NOT ask a "
@@ -87,11 +103,17 @@ def clarify(state: ResearchState) -> dict[str, object]:
     if state.get("clarification_questions"):
         return {}
 
-    llm: ChatOpenAI = ChatOpenAI(model=LEAD_MODEL, temperature=0)
-    chain = _PROMPT | llm.with_structured_output(ClarifyDecision, method="function_calling")
-    decision: ClarifyDecision = chain.invoke(  # type: ignore[assignment]
+    model = state.get("lead_model", LEAD_MODEL)
+    llm: ChatOpenAI = ChatOpenAI(model=model, temperature=0)
+    chain = _PROMPT | llm.with_structured_output(
+        ClarifyDecision, method="function_calling", include_raw=True
+    )
+    raw = chain.invoke(
         {"query": state["query"], "current_date": date.today().strftime("%B %d, %Y")}
     )
+    decision: ClarifyDecision = raw["parsed"]
+    usage = usage_from_message(raw["raw"], "clarify", model)
+    token_usage = [usage] if usage else []
 
     if not decision.is_ambiguous:
         return {
@@ -99,12 +121,14 @@ def clarify(state: ResearchState) -> dict[str, object]:
             "clarification_questions": [],
             "clarification_options": [],
             "clarifications": [],
+            "token_usage": token_usage,
         }
 
     # Store both questions and chip options so the API can forward them to the UI.
     return {
         "clarification_questions": [q.question for q in decision.questions_with_options],
         "clarification_options": [q.options for q in decision.questions_with_options],
+        "token_usage": token_usage,
     }
 
 

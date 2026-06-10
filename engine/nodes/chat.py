@@ -51,10 +51,12 @@ async def answer_followup(
 
     findings: list[SubtaskFinding] = []
     report = ""
+    lead_model = LEAD_MODEL
     if snapshot is not None:
         channel_values = snapshot.checkpoint.get("channel_values", {})
         findings = channel_values.get("findings", [])
         report = channel_values.get("report", "")
+        lead_model = channel_values.get("lead_model", LEAD_MODEL)
 
     context = _format_context(findings, report)
 
@@ -68,7 +70,7 @@ async def answer_followup(
         HumanMessage(content=question),
     ]
 
-    llm: ChatOpenAI = ChatOpenAI(model=LEAD_MODEL, temperature=0, streaming=True)
+    llm: ChatOpenAI = ChatOpenAI(model=lead_model, temperature=0, streaming=True)
     async for chunk in llm.astream(messages):
         if chunk.content:
             yield str(chunk.content)

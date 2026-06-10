@@ -6,6 +6,7 @@ from langchain_openai import ChatOpenAI
 
 from engine.models import LEAD_MODEL
 from engine.state import ResearchState
+from engine.usage import usage_from_message
 
 _PROMPT = ChatPromptTemplate.from_messages([
     (
@@ -71,14 +72,16 @@ def _format_findings(findings: list[dict[str, str]]) -> str:
     return "\n\n".join(lines)
 
 
-def synthesize(state: ResearchState) -> dict[str, str]:
+def synthesize(state: ResearchState) -> dict[str, object]:
     """Write a cited Markdown report from compacted summary or raw findings (synthesize node)."""
     # Prefer the compacted summary (layer 2) — fall back to raw findings if compact was skipped
     summary = state.get("summary", "")
     findings_text = summary if summary else _format_findings(state.get("findings", []))  # type: ignore[arg-type]
-    llm: ChatOpenAI = ChatOpenAI(model=LEAD_MODEL, temperature=0)
+    model = state.get("lead_model", LEAD_MODEL)
+    llm: ChatOpenAI = ChatOpenAI(model=model, temperature=0)
     chain = _PROMPT | llm
     result: BaseMessage = chain.invoke(  # type: ignore[assignment]
         {"query": state["query"], "findings_text": findings_text}
     )
-    return {"report": str(result.content)}
+    usage = usage_from_message(result, "synthesize", model)
+    return {"report": str(result.content), "token_usage": [usage] if usage else []}

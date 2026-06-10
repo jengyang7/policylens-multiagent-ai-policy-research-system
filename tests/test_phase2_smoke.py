@@ -72,7 +72,7 @@ def test_compact_node_calls_compaction(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(
         "engine.nodes.compact.compact_findings",
-        lambda findings: "mocked summary",
+        lambda findings, lead_model: ("mocked summary", None),
     )
 
     state: ResearchState = {

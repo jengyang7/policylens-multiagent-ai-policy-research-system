@@ -6,6 +6,7 @@ from pydantic import BaseModel
 
 from engine.models import LEAD_MODEL
 from engine.state import ResearchState
+from engine.usage import usage_from_message
 
 
 class ResearchPlan(BaseModel):
@@ -29,7 +30,16 @@ _PROMPT = ChatPromptTemplate.from_messages([
 
 def plan(state: ResearchState) -> dict:  # type: ignore[type-arg]
     """Decompose the research query into parallel sub-questions (plan node)."""
-    llm: ChatOpenAI = ChatOpenAI(model=LEAD_MODEL, temperature=0)
-    chain = _PROMPT | llm.with_structured_output(ResearchPlan, method="function_calling")
-    result: ResearchPlan = chain.invoke({"query": state["query"]})  # type: ignore[assignment]
-    return {"subtasks": result.subtasks, "supervisor_thinking": result.thinking}
+    model = state.get("lead_model", LEAD_MODEL)
+    llm: ChatOpenAI = ChatOpenAI(model=model, temperature=0)
+    chain = _PROMPT | llm.with_structured_output(
+        ResearchPlan, method="function_calling", include_raw=True
+    )
+    raw = chain.invoke({"query": state["query"]})
+    result: ResearchPlan = raw["parsed"]
+    usage = usage_from_message(raw["raw"], "plan", model)
+    return {
+        "subtasks": result.subtasks,
+        "supervisor_thinking": result.thinking,
+        "token_usage": [usage] if usage else [],
+    }

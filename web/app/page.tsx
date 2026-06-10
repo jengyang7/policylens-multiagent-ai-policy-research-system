@@ -12,6 +12,36 @@ type LogType = 'start' | 'plan' | 'subtask' | 'synthesis' | 'report' | 'complete
 interface SubtaskState { question: string; status: 'pending' | 'done'; findingsCount: number; }
 interface ChatMessage  { role: 'user' | 'assistant'; content: string; }
 interface LogEntry     { id: number; type: LogType; label: string; detail?: string; ts: string; createdAt: number; serverTs?: number; }
+interface ModelOption  { id: string; label: string; description: string; }
+
+interface UsageStats {
+  leadModel: string;
+  subagentModel: string;
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+  totalTokens: number;
+  costUsd: number;
+  elapsedSeconds: number;
+}
+
+interface HistoryEntry {
+  id: string;
+  query: string;
+  runId: string;
+  createdAt: number;
+  phase: Phase;
+  subtasks: SubtaskState[];
+  sources: string[];
+  log: LogEntry[];
+  report: string;
+  showReport: boolean;
+  chatMessages: ChatMessage[];
+  usageStats: UsageStats | null;
+}
+
+const HISTORY_KEY = 'dra_history_v1';
+const ACTIVE_ID_KEY = 'dra_active_id_v1';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -73,6 +103,76 @@ function SendIcon({ className = 'w-4 h-4' }: { className?: string }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Model picker (custom dropdown — replaces the native <select>)
+// ---------------------------------------------------------------------------
+
+function ModelPicker({
+  options, value, onChange, disabled,
+}: {
+  options: ModelOption[];
+  value: string;
+  onChange: (id: string) => void;
+  disabled: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    function onPointerDown(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener('mousedown', onPointerDown);
+    return () => document.removeEventListener('mousedown', onPointerDown);
+  }, []);
+
+  const selected = options.find(o => o.id === value);
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen(v => !v)}
+        disabled={disabled}
+        className="flex items-center gap-1.5 text-xs font-medium text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded-lg px-2.5 py-1.5 transition-colors disabled:cursor-default disabled:opacity-50"
+      >
+        {selected?.label ?? 'Model'}
+        <svg className={`w-3 h-3 transition-transform ${open ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+        </svg>
+      </button>
+
+      {open && (
+        <div className="absolute top-full right-0 mt-2 w-64 rounded-xl border border-gray-200 bg-white shadow-lg overflow-hidden z-10">
+          {options.map(opt => {
+            const isSelected = opt.id === value;
+            return (
+              <button
+                key={opt.id}
+                type="button"
+                onClick={() => { onChange(opt.id); setOpen(false); }}
+                className={`flex w-full items-start gap-2 px-3.5 py-2.5 text-left transition-colors ${
+                  isSelected ? 'bg-blue-50' : 'hover:bg-gray-50'
+                }`}
+              >
+                <div className="flex-1 min-w-0">
+                  <p className={`text-sm font-medium ${isSelected ? 'text-blue-700' : 'text-gray-800'}`}>{opt.label}</p>
+                  <p className="text-xs text-gray-400 mt-0.5">{opt.description}</p>
+                </div>
+                {isSelected && (
+                  <svg className="w-4 h-4 text-blue-600 flex-shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                  </svg>
+                )}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function StepIconCircle({ type }: { type: LogType }) {
   type Cfg = { bg: string; color: string; d: string };
   const cfg: Record<LogType, Cfg> = {
@@ -96,10 +196,37 @@ function StepIconCircle({ type }: { type: LogType }) {
 }
 
 // ---------------------------------------------------------------------------
-// Sidebar (no progress bar)
+// Sidebar (New Research + Recents history)
 // ---------------------------------------------------------------------------
 
-function Sidebar() {
+function HistoryItemIcon() {
+  return (
+    <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}>
+      <path strokeLinecap="round" strokeLinejoin="round"
+        d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.86 9.86 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+    </svg>
+  );
+}
+
+function TrashIcon() {
+  return (
+    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}>
+      <path strokeLinecap="round" strokeLinejoin="round"
+        d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6M4 7h16M9 7V4a1 1 0 011-1h4a1 1 0 011 1v3" />
+    </svg>
+  );
+}
+
+function Sidebar({
+  history, activeId, locked, onNewResearch, onSelect, onDelete,
+}: {
+  history: HistoryEntry[];
+  activeId: string | null;
+  locked: boolean;
+  onNewResearch: () => void;
+  onSelect: (entry: HistoryEntry) => void;
+  onDelete: (id: string, e: React.MouseEvent) => void;
+}) {
   return (
     <aside className="w-60 flex-shrink-0 bg-gray-50 border-r border-gray-200 flex flex-col select-none">
       {/* Brand */}
@@ -109,35 +236,59 @@ function Sidebar() {
         </h1>
       </div>
 
-      {/* Nav */}
-      <nav className="flex-1 px-3 py-4 space-y-1 text-sm">
-        {/* Research — active: white card with border */}
-        <button className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl bg-white border border-gray-200 text-gray-900 font-semibold shadow-sm">
-          {/* Sparkles / AI icon */}
+      {/* New Research */}
+      <div className="px-3 pt-4">
+        <button
+          onClick={onNewResearch}
+          className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl bg-white border border-gray-200 text-gray-900 font-semibold shadow-sm hover:border-gray-300 transition-colors text-sm"
+        >
           <svg className="w-[18px] h-[18px] text-gray-700 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}>
-            <path strokeLinecap="round" strokeLinejoin="round"
-              d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" />
+            <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
           </svg>
-          Research
+          New Research
         </button>
+      </div>
 
-        {/* Compare */}
-        <button className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-gray-500 hover:bg-gray-100 hover:text-gray-800 transition-colors">
-          <svg className="w-[18px] h-[18px] flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}>
-            <path strokeLinecap="round" strokeLinejoin="round"
-              d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-          </svg>
-          Compare
-        </button>
-
-        {/* History */}
-        <button className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-gray-500 hover:bg-gray-100 hover:text-gray-800 transition-colors">
-          <svg className="w-[18px] h-[18px] flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-          </svg>
-          History
-        </button>
-      </nav>
+      {/* Recents */}
+      <div className="flex-1 min-h-0 flex flex-col px-3 pt-5 pb-3">
+        <p className="px-3 text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-1.5">
+          Recents
+        </p>
+        <div className="flex-1 overflow-y-auto space-y-0.5 text-sm">
+          {history.length === 0 ? (
+            <p className="px-3 py-2 text-xs text-gray-400">No research yet</p>
+          ) : history.map(entry => {
+            const isActive = entry.id === activeId;
+            const isLive = isActive && (entry.phase === 'researching' || entry.phase === 'querying' || entry.phase === 'clarifying');
+            return (
+              <div
+                key={entry.id}
+                role="button"
+                tabIndex={0}
+                aria-disabled={locked && !isActive}
+                onClick={() => onSelect(entry)}
+                onKeyDown={e => { if (e.key === 'Enter') onSelect(entry); }}
+                className={`group w-full flex items-center gap-2 px-3 py-2 rounded-xl transition-colors ${
+                  isActive
+                    ? 'bg-white border border-gray-200 text-gray-900 font-semibold shadow-sm'
+                    : 'text-gray-500 hover:bg-gray-100 hover:text-gray-800'
+                } ${locked && !isActive ? 'opacity-50' : ''}`}
+              >
+                <HistoryItemIcon />
+                <span className="flex-1 truncate">{entry.query || 'Untitled research'}</span>
+                {isLive && <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse flex-shrink-0" />}
+                <button
+                  onClick={e => onDelete(entry.id, e)}
+                  className="flex-shrink-0 opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 transition-opacity p-0.5"
+                  aria-label="Delete research"
+                >
+                  <TrashIcon />
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      </div>
     </aside>
   );
 }
@@ -167,13 +318,20 @@ export default function Home() {
   const [chatStreaming, setChatStreaming] = useState(false);
 
   const [rightTab,      setRightTab]     = useState<'steps' | 'sources'>('steps');
-  const [expandedLogs,  setExpandedLogs] = useState<Set<number>>(new Set());
+  const [collapsedLogs, setCollapsedLogs] = useState<Set<number>>(new Set());
 
   const [supervisorThinking,         setSupervisorThinking]         = useState('');
   const [supervisorThinkingExpanded, setSupervisorThinkingExpanded] = useState(false);
   const [synthesizingActive,         setSynthesizingActive]         = useState(false);
   const [researchEndTime,            setResearchEndTime]            = useState<number | null>(null);
   const [copied,                     setCopied]                     = useState(false);
+  const [usageStats,                 setUsageStats]                 = useState<UsageStats | null>(null);
+
+  const [history,  setHistory]  = useState<HistoryEntry[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+
+  const [modelOptions, setModelOptions] = useState<ModelOption[]>([]);
+  const [selectedModel, setSelectedModel] = useState('');
 
   const logEndRef  = useRef<HTMLDivElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
@@ -181,42 +339,77 @@ export default function Home() {
   useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [log]);
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [chatMessages]);
 
-  // Restore session from sessionStorage on mount (survives page refresh)
+  // Load a history entry's saved state into the active session view
+  function restoreEntry(entry: HistoryEntry) {
+    setQuery(entry.query);
+    setRunId(entry.runId);
+    setSubtasks(entry.subtasks);
+    setSources(entry.sources);
+    setLog(entry.log);
+    setReport(entry.report);
+    setShowReport(entry.showReport);
+    setChatMessages(entry.chatMessages);
+    setCollapsedLogs(new Set());
+    setSupervisorThinking(''); setSupervisorThinkingExpanded(false);
+    setSynthesizingActive(false); setCopied(false);
+    setUsageStats(entry.usageStats);
+    setError(''); setClarifyQuestions([]); setClarifyOptions([]); setClarifyAnswers([]);
+    // Transient phases can't be resumed after a refresh/switch — reset them
+    const transient: Phase[] = ['researching', 'querying', 'clarifying'];
+    const restoredPhase = transient.includes(entry.phase) ? (entry.report ? 'done' : 'idle') : entry.phase;
+    setPhase(restoredPhase);
+    // For a finished run, anchor the last step's duration to its own timestamp
+    // instead of leaving it stuck on "Running…"
+    const lastLog = entry.log[entry.log.length - 1];
+    setResearchEndTime(restoredPhase === 'done' && lastLog ? (lastLog.serverTs ?? lastLog.createdAt) : null);
+  }
+
+  // Fetch selectable lead models for the New Research page
+  useEffect(() => {
+    fetch(`${API}/models`)
+      .then(res => res.json())
+      .then((data: { default: string; options: ModelOption[] }) => {
+        setModelOptions(data.options ?? []);
+        setSelectedModel(data.default ?? '');
+      })
+      .catch(() => { /* model picker is optional — backend falls back to its default */ });
+  }, []);
+
+  // Restore history + active session from localStorage on mount
   useEffect(() => {
     try {
-      const raw = sessionStorage.getItem('dra_session_v1');
-      if (!raw) return;
-      const s = JSON.parse(raw) as {
-        phase: Phase; query: string; runId: string;
-        subtasks: SubtaskState[]; sources: string[];
-        log: LogEntry[]; report: string; showReport: boolean;
-        chatMessages: ChatMessage[];
-      };
-      setQuery(s.query ?? '');
-      setRunId(s.runId ?? '');
-      setSubtasks(s.subtasks ?? []);
-      setSources(s.sources ?? []);
-      setLog(s.log ?? []);
-      setReport(s.report ?? '');
-      setShowReport(s.showReport ?? false);
-      setChatMessages(s.chatMessages ?? []);
-      // Transient phases can't be resumed after a refresh — reset them
-      const transient: Phase[] = ['researching', 'querying', 'clarifying'];
-      const p: Phase = transient.includes(s.phase)
-        ? (s.report ? 'done' : 'idle')
-        : (s.phase ?? 'idle');
-      setPhase(p);
+      const rawHistory = localStorage.getItem(HISTORY_KEY);
+      const hist: HistoryEntry[] = rawHistory ? JSON.parse(rawHistory) : [];
+      setHistory(hist);
+      const aid = localStorage.getItem(ACTIVE_ID_KEY);
+      const entry = aid ? hist.find(h => h.id === aid) : undefined;
+      if (entry) {
+        restoreEntry(entry);
+        setActiveId(entry.id);
+      }
     } catch { /* ignore parse errors */ }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Persist session to sessionStorage whenever meaningful state changes
+  // Persist history list to localStorage whenever it changes
+  useEffect(() => {
+    try { localStorage.setItem(HISTORY_KEY, JSON.stringify(history)); } catch { /* ignore quota errors */ }
+  }, [history]);
+
+  // Persist which history entry is active
   useEffect(() => {
     try {
-      sessionStorage.setItem('dra_session_v1', JSON.stringify({
-        phase, query, runId, subtasks, sources, log, report, showReport, chatMessages,
-      }));
+      if (activeId) localStorage.setItem(ACTIVE_ID_KEY, activeId);
+      else localStorage.removeItem(ACTIVE_ID_KEY);
     } catch { /* ignore quota errors */ }
-  }, [phase, query, runId, subtasks, sources, log, report, showReport, chatMessages]);
+  }, [activeId]);
+
+  // Keep the active history entry's saved snapshot in sync with the live session
+  useEffect(() => {
+    if (!activeId) return;
+    setHistory(prev => prev.map(h => h.id === activeId
+      ? { ...h, query, runId, phase, subtasks, sources, log, report, showReport, chatMessages, usageStats }
+      : h));
+  }, [activeId, phase, query, runId, subtasks, sources, log, report, showReport, chatMessages, usageStats]);
 
   // Progress — starts at 3 (tiny pulse), never 100 until report revealed, never goes backward
   const progressPct = (() => {
@@ -238,8 +431,8 @@ export default function Home() {
     setLog(prev => [...prev, mkLog(type, label, detail, serverTs)]);
   }
 
-  function toggleExpand(id: number) {
-    setExpandedLogs(prev => {
+  function toggleCollapse(id: number) {
+    setCollapsedLogs(prev => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id); else next.add(id);
       return next;
@@ -290,6 +483,19 @@ export default function Home() {
       setPhase('done');
       setResearchEndTime(endTs);
       setSubtasks(prev => prev.map(s => s.status === 'pending' ? { ...s, status: 'done' } : s));
+      const u = data.usage as Record<string, unknown> | undefined;
+      if (u) {
+        setUsageStats({
+          leadModel: u.lead_model as string,
+          subagentModel: u.subagent_model as string,
+          inputTokens: u.input_tokens as number,
+          outputTokens: u.output_tokens as number,
+          cachedTokens: u.cached_tokens as number,
+          totalTokens: u.total_tokens as number,
+          costUsd: u.cost_usd as number,
+          elapsedSeconds: u.elapsed_seconds as number,
+        });
+      }
       addLog('complete', 'Completed', undefined, serverTs);
     } else if (type === 'error') {
       setError(data.message as string);
@@ -304,19 +510,30 @@ export default function Home() {
 
   async function startResearch() {
     if (!query.trim()) return;
+    const trimmed = query.trim();
     setPhase('querying');
     setSubtasks([]); setSources([]); setReport(''); setShowReport(false);
     setError(''); setChatMessages([]); setRunId('');
     setSupervisorThinking(''); setSupervisorThinkingExpanded(false);
-    setSynthesizingActive(false); setResearchEndTime(null);
+    setSynthesizingActive(false); setResearchEndTime(null); setUsageStats(null);
     setClarifyQuestions([]); setClarifyOptions([]); setClarifyAnswers([]);
-    setLog([mkLog('start', 'Initialization', `Query: ${query.trim().slice(0, 120)}`)]);
+    setLog([mkLog('start', 'Initialization', `Query: ${trimmed.slice(0, 120)}`)]);
     setRightTab('steps');
-    setExpandedLogs(new Set());
+    setCollapsedLogs(new Set());
+
+    // Immediately add this run to history (Recents)
+    const id = crypto.randomUUID();
+    setActiveId(id);
+    setHistory(prev => [{
+      id, query: trimmed, runId: '', createdAt: Date.now(), phase: 'querying',
+      subtasks: [], sources: [], log: [], report: '', showReport: false, chatMessages: [],
+      usageStats: null,
+    }, ...prev]);
+
     try {
       const res = await fetch(`${API}/research`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: query.trim() }),
+        body: JSON.stringify({ query: query.trim(), model: selectedModel || undefined }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
       await readStream(res, handleEvent);
@@ -365,11 +582,28 @@ export default function Home() {
   function reset() {
     setPhase('idle'); setQuery(''); setSubtasks([]); setSources([]);
     setReport(''); setShowReport(false); setChatMessages([]);
-    setRunId(''); setLog([]); setError(''); setExpandedLogs(new Set());
+    setRunId(''); setLog([]); setError(''); setCollapsedLogs(new Set());
     setSupervisorThinking(''); setSupervisorThinkingExpanded(false);
     setSynthesizingActive(false); setResearchEndTime(null); setCopied(false);
-    setClarifyOptions([]);
-    try { sessionStorage.removeItem('dra_session_v1'); } catch { /* ignore */ }
+    setUsageStats(null);
+    setClarifyQuestions([]); setClarifyOptions([]); setClarifyAnswers([]);
+    setActiveId(null);
+  }
+
+  // Switch the main view to a past research session from the sidebar
+  function selectEntry(entry: HistoryEntry) {
+    if (entry.id === activeId) return;
+    if (phase === 'researching' || phase === 'querying' || phase === 'clarifying') return;
+    restoreEntry(entry);
+    setActiveId(entry.id);
+  }
+
+  // Remove a research session from history (and reset the view if it was active)
+  function deleteEntry(id: string, e: React.MouseEvent) {
+    e.stopPropagation();
+    if (!window.confirm('Delete this research from history?')) return;
+    setHistory(prev => prev.filter(h => h.id !== id));
+    if (id === activeId) reset();
   }
 
   function copyReport() {
@@ -387,7 +621,14 @@ export default function Home() {
   return (
     <div className="flex h-screen bg-white text-gray-900 overflow-hidden">
 
-      <Sidebar />
+      <Sidebar
+        history={history}
+        activeId={activeId}
+        locked={phase === 'researching' || phase === 'querying' || phase === 'clarifying'}
+        onNewResearch={reset}
+        onSelect={selectEntry}
+        onDelete={deleteEntry}
+      />
 
       <div className="flex-1 flex flex-col min-w-0">
 
@@ -399,31 +640,45 @@ export default function Home() {
               /* ── Home: hero + centered input ── */
               <div className="flex-1 flex flex-col items-center justify-center gap-4 px-6 text-center">
                 <span className="text-5xl mb-1">🔍</span>
-                <h2 className="text-2xl font-bold text-gray-900">Start Your Research</h2>
-                <p className="text-gray-400 text-sm max-w-md">
-                  Ask a question to begin comprehensive AI-powered research
-                </p>
+                <div className="flex flex-col items-center gap-1">
+                  <h2 className="text-2xl font-bold text-gray-900">Start Your Research</h2>
+                  <p className="text-gray-400 text-sm max-w-md">
+                    Ask a question to begin comprehensive AI-powered research
+                  </p>
+                </div>
                 {phase === 'error' && (
                   <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-xl px-4 py-2 max-w-lg">
                     {error}
                   </p>
                 )}
-                <div className="flex items-center gap-3 w-full max-w-2xl mt-2">
-                  <input
-                    value={query}
-                    onChange={e => setQuery(e.target.value)}
-                    onKeyDown={e => e.key === 'Enter' && phase === 'idle' && startResearch()}
-                    placeholder="What are the top AI trends shaping 2026?"
-                    disabled={phase === 'querying'}
-                    className="flex-1 border border-gray-300 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500 transition-colors disabled:bg-gray-50 disabled:text-gray-600 disabled:cursor-default"
-                  />
-                  <button
-                    onClick={startResearch}
-                    disabled={!query.trim() || phase === 'querying'}
-                    className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl px-5 py-3 text-sm font-semibold transition-colors whitespace-nowrap"
-                  >
-                    {phase === 'querying' ? <><Spinner /> Thinking…</> : <><SendIcon /> Research</>}
-                  </button>
+                <div className="w-full max-w-2xl mt-2">
+                  <div className="flex flex-col border border-gray-300 rounded-2xl bg-white focus-within:ring-2 focus-within:ring-blue-500/40 focus-within:border-blue-500 transition-colors">
+                    <input
+                      value={query}
+                      onChange={e => setQuery(e.target.value)}
+                      onKeyDown={e => e.key === 'Enter' && phase === 'idle' && startResearch()}
+                      placeholder="What are the top AI trends shaping 2026?"
+                      disabled={phase === 'querying'}
+                      className="w-full bg-transparent px-4 pt-4 pb-2 text-sm focus:outline-none disabled:text-gray-600 disabled:cursor-default min-h-[64px]"
+                    />
+                    <div className="flex items-center justify-end gap-2 px-3 pb-2.5 pt-1">
+                      {modelOptions.length > 0 && (
+                        <ModelPicker
+                          options={modelOptions}
+                          value={selectedModel}
+                          onChange={setSelectedModel}
+                          disabled={phase === 'querying'}
+                        />
+                      )}
+                      <button
+                        onClick={startResearch}
+                        disabled={!query.trim() || phase === 'querying'}
+                        className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl px-4 py-1.5 text-sm font-semibold transition-colors whitespace-nowrap"
+                      >
+                        {phase === 'querying' ? <><Spinner /> Thinking…</> : <><SendIcon /> Research</>}
+                      </button>
+                    </div>
+                  </div>
                 </div>
               </div>
             ) : (
@@ -513,17 +768,6 @@ export default function Home() {
                   <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" /> Live
                 </span>
               )}
-              {phase === 'done' && (
-                <button
-                  onClick={reset}
-                  className="ml-auto flex items-center gap-1.5 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold rounded-lg px-3 py-1.5 transition-colors"
-                >
-                  <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
-                  </svg>
-                  New Research
-                </button>
-              )}
             </div>
 
             {/* Progress bar — starts at 3%, never goes backward, 100% only when report revealed */}
@@ -596,6 +840,39 @@ export default function Home() {
                   </div>
                 )}
 
+                {/* Usage & cost summary */}
+                {phase === 'done' && usageStats && (
+                  <div className="mx-8 mt-4 rounded-2xl border border-gray-200 bg-gray-50 px-5 py-4">
+                    <p className="text-[11px] uppercase tracking-wide text-gray-400 font-medium mb-3">
+                      Usage Summary
+                    </p>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                      <div>
+                        <p className="text-[11px] text-gray-400 mb-0.5">Models</p>
+                        <p className="text-sm font-semibold text-gray-800">
+                          {modelOptions.find(o => o.id === usageStats.leadModel)?.label ?? usageStats.leadModel}
+                        </p>
+                        <p className="text-[11px] text-gray-400 mt-0.5">+ {usageStats.subagentModel}</p>
+                      </div>
+                      <div>
+                        <p className="text-[11px] text-gray-400 mb-0.5">Total Tokens</p>
+                        <p className="text-sm font-semibold text-gray-800">{usageStats.totalTokens.toLocaleString()}</p>
+                        <p className="text-[11px] text-gray-400 mt-0.5">
+                          {usageStats.inputTokens.toLocaleString()} in / {usageStats.outputTokens.toLocaleString()} out
+                        </p>
+                      </div>
+                      <div>
+                        <p className="text-[11px] text-gray-400 mb-0.5">Estimated Cost</p>
+                        <p className="text-sm font-semibold text-gray-800">${usageStats.costUsd.toFixed(4)}</p>
+                      </div>
+                      <div>
+                        <p className="text-[11px] text-gray-400 mb-0.5">Total Time</p>
+                        <p className="text-sm font-semibold text-gray-800">{usageStats.elapsedSeconds.toFixed(1)}s</p>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
                 {/* Inline step indicators */}
                 <div className="px-8 pt-5 pb-2 space-y-3">
                   {/* Planning */}
@@ -606,8 +883,8 @@ export default function Home() {
                     </div>
                   )}
 
-                  {/* Supervisor thinking block */}
-                  {supervisorThinking && (
+                  {/* Supervisor thinking block — only while researching is in progress */}
+                  {phase === 'researching' && supervisorThinking && (
                     <div className="text-sm text-gray-700">
                       <p>
                         <span className="text-base mr-1.5">🤔</span>
@@ -800,7 +1077,7 @@ export default function Home() {
                         <div className="absolute left-[27px] top-6 bottom-6 w-0.5 bg-gradient-to-b from-blue-300 via-purple-300 to-emerald-300 opacity-50" />
 
                         {log.map((entry, i) => {
-                          const expanded = expandedLogs.has(entry.id);
+                          const expanded = !collapsedLogs.has(entry.id);
                           const isLast = i === log.length - 1;
                           // Use server timestamps when available for accurate per-step timing
                           const getTs = (e: LogEntry) => e.serverTs ?? e.createdAt;
@@ -846,10 +1123,10 @@ export default function Home() {
                                       </p>
                                     )}
                                     <button
-                                      onClick={() => toggleExpand(entry.id)}
+                                      onClick={() => toggleCollapse(entry.id)}
                                       className="text-[10px] text-blue-500 hover:text-blue-700 flex items-center gap-0.5 transition-colors"
                                     >
-                                      <span className="text-[9px]">{expanded ? '▼' : '▶'}</span> View metadata
+                                      <span className="text-[9px]">{expanded ? '▲' : '▶'}</span> {expanded ? 'Hide metadata' : 'View metadata'}
                                     </button>
                                   </>
                                 )}
