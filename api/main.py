@@ -195,10 +195,13 @@ async def _stream_graph(
                 if node_name == "plan":
                     subtasks: list[str] = node_output.get("subtasks", [])  # type: ignore[union-attr]
                     thinking: str = node_output.get("supervisor_thinking", "")  # type: ignore[union-attr]
-                    await _update_run(run_id, "running", plan={"subtasks": subtasks})
+                    title: str = node_output.get("title", "")
+                    await _update_run(
+                        run_id, "running", plan={"subtasks": subtasks}, title=title or None
+                    )
                     if thinking:
                         yield _evt({"type": "plan_thinking", "content": thinking})
-                    yield _evt({"type": "plan", "subtasks": subtasks})
+                    yield _evt({"type": "plan", "subtasks": subtasks, "title": title})
 
                 elif node_name == "subagent":
                     findings: list[dict] = node_output.get("findings", [])  # type: ignore[union-attr]
@@ -303,6 +306,7 @@ async def start_research(body: ResearchRequest, request: Request) -> EventSource
         "clarification_options": [],
         "clarifications": [],
         "supervisor_thinking": "",
+        "title": "",
         "subtasks": [],
         "findings": [],
         "summary": "",
@@ -352,6 +356,7 @@ async def get_run(run_id: str) -> dict[str, object]:
     return {
         "id": run.id,
         "query": run.query,
+        "title": run.title,
         "status": run.status,
         "plan": run.plan,
         "clarifications": run.clarifications,
@@ -386,6 +391,7 @@ async def list_runs(
         {
             "id": r.id,
             "query": r.query,
+            "title": r.title,
             "status": r.status,
             "started_at": r.started_at.isoformat() if r.started_at else None,
             "finished_at": r.finished_at.isoformat() if r.finished_at else None,

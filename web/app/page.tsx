@@ -29,6 +29,7 @@ interface UsageStats {
 interface HistoryEntry {
   id: string;
   query: string;
+  title: string;
   runId: string;
   createdAt: number;
   phase: Phase;
@@ -334,7 +335,7 @@ function Sidebar({
                 } ${locked && !isActive ? 'opacity-50' : ''}`}
               >
                 <HistoryItemIcon />
-                <span className="flex-1 truncate">{entry.query || 'Untitled research'}</span>
+                <span className="flex-1 truncate">{entry.title || entry.query || 'Untitled research'}</span>
                 {isLive && <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse flex-shrink-0" />}
                 <button
                   onClick={e => onDelete(entry.id, e)}
@@ -360,6 +361,7 @@ function Sidebar({
 export default function Home() {
   const [phase, setPhase]     = useState<Phase>('idle');
   const [query, setQuery]     = useState('');
+  const [title, setTitle]     = useState('');
   const [runId, setRunId]     = useState('');
   const [error, setError]     = useState('');
   const [report, setReport]   = useState('');
@@ -418,6 +420,7 @@ export default function Home() {
   // Load a history entry's saved state into the active session view
   function restoreEntry(entry: HistoryEntry) {
     setQuery(entry.query);
+    setTitle(entry.title || '');
     setRunId(entry.runId);
     setSubtasks(entry.subtasks);
     setSources(entry.sources);
@@ -498,9 +501,9 @@ export default function Home() {
   useEffect(() => {
     if (!activeId) return;
     setHistory(prev => prev.map(h => h.id === activeId
-      ? { ...h, query, runId, phase, subtasks, sources, log, report, showReport, chatMessages, usageStats }
+      ? { ...h, query, title, runId, phase, subtasks, sources, log, report, showReport, chatMessages, usageStats }
       : h));
-  }, [activeId, phase, query, runId, subtasks, sources, log, report, showReport, chatMessages, usageStats]);
+  }, [activeId, phase, query, title, runId, subtasks, sources, log, report, showReport, chatMessages, usageStats]);
 
   // Progress — starts at 3 (tiny pulse), never 100 until report revealed, never goes backward
   const progressPct = (() => {
@@ -512,7 +515,7 @@ export default function Home() {
     return 15 + sub; // 15% when plan arrives → up to 90% — always > 3%, never backward
   })();
 
-  const displayQuery = query ? query.charAt(0).toUpperCase() + query.slice(1) : '';
+  const displayQuery = title || (query ? query.charAt(0).toUpperCase() + query.slice(1) : '');
 
   // -------------------------------------------------------------------------
   // Helpers
@@ -545,6 +548,8 @@ export default function Home() {
       setPhase(p => (p === 'querying' ? 'researching' : p));
       const qs = (data.subtasks as string[]) ?? [];
       setSubtasks(qs.map(q => ({ question: q, status: 'pending', findingsCount: 0 })));
+      const planTitle = data.title as string | undefined;
+      if (planTitle) setTitle(planTitle);
     } else if (type === 'subtask_done') {
       const q     = data.question as string;
       const count = (data.findings_count as number) ?? 0;
@@ -603,6 +608,7 @@ export default function Home() {
     if (!query.trim()) return;
     const trimmed = query.trim();
     setPhase('querying');
+    setTitle('');
     setSubtasks([]); setSources([]); setReport(''); setShowReport(false);
     setError(''); setChatMessages([]); setRunId('');
     setSupervisorThinking(''); setSupervisorThinkingExpanded(false);
@@ -616,7 +622,7 @@ export default function Home() {
     const id = crypto.randomUUID();
     setActiveId(id);
     setHistory(prev => [{
-      id, query: trimmed, runId: '', createdAt: Date.now(), phase: 'querying',
+      id, query: trimmed, title: '', runId: '', createdAt: Date.now(), phase: 'querying',
       subtasks: [], sources: [], log: [], report: '', showReport: false, chatMessages: [],
       usageStats: null,
     }, ...prev]);

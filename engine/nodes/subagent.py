@@ -9,6 +9,7 @@ from engine.state import SubagentInput, SubtaskFinding, TokenUsage
 from engine.tools.fetch import fetch
 from engine.tools.search import search
 from engine.usage import usage_from_message
+from eval.grounding import check_grounding
 
 _PROMPT = ChatPromptTemplate.from_messages([
     (
@@ -16,10 +17,16 @@ _PROMPT = ChatPromptTemplate.from_messages([
         "You are a research extraction agent. Given a sub-question and web content, "
         "extract every relevant finding. Each finding requires:\n"
         "- claim: a clear, factual statement directly supported by the content\n"
-        "- evidence_span: the exact quote or passage from the content that supports the claim\n"
+        "- evidence_span: a VERBATIM quote copied character-for-character from the "
+        "content above — do not paraphrase, summarize, correct typos, or merge text "
+        "from different parts of the page. Keep it short: one sentence or a brief "
+        "contiguous passage (ideally under 300 characters) so it can be located "
+        "exactly in the source.\n"
         "- citation_url: the URL of the source\n\n"
-        "Only include findings directly supported by the provided content. "
-        "If no relevant findings exist, return an empty list.",
+        "Only include findings directly supported by the provided content, and only "
+        "if you can produce a verbatim evidence_span for them. If you cannot find an "
+        "exact quote that supports a claim, drop that finding. If no relevant "
+        "findings exist, return an empty list.",
     ),
     (
         "human",
@@ -70,14 +77,19 @@ def subagent(state: SubagentInput) -> dict[str, object]:
             if extracted is None:
                 continue
             for f in extracted.findings:
-                findings.append(
-                    SubtaskFinding(
-                        subtask=question,
-                        claim=f.claim,
-                        evidence_span=f.evidence_span,
-                        citation_url=str(f.citation_url),
-                    )
+                finding = SubtaskFinding(
+                    subtask=question,
+                    claim=f.claim,
+                    evidence_span=f.evidence_span,
+                    citation_url=str(f.citation_url),
                 )
+                # Self-check (anti-hallucination): run the same grounding check the
+                # eval harness runs later, against the content this LLM actually saw.
+                # Drops findings whose evidence_span isn't a real quote from the page
+                # before they ever reach synthesis — keeps ungrounded_count near zero
+                # for any topic, not just this one.
+                if check_grounding(finding, content[:6_000]).grounded:
+                    findings.append(finding)
         except Exception:
             # Silently drop unextractable sources; don't let one bad page fail the subtask
             continue

@@ -90,3 +90,25 @@ monkeypatch.setattr("engine.nodes.synthesize.ChatOpenAI", lambda **kw: mock_llm)
 **Validated result:** Re-ran `synthesize()` (with the Issue-B-1 prompt fix) + the new `verify_citations()` end-to-end on this run's findings, then re-checked faithfulness on the corrected report: 63 cited sentences (101 left uncited), 7 unfaithful → **88.9% faithful** — within the 85-90% production target.
 
 **Cost tradeoff:** `verify_citations` adds ~112 extra `gpt-5.4-mini` judge calls (~$0.24 at this run's scale — 156 findings / a ~28K-character draft report) to every research run. This is the per-run price of the anti-hallucination guard; smaller reports/finding-sets will cost proportionally less.
+
+---
+
+### 9. Subagent extraction produces ungrounded `evidence_span` (paraphrased quotes)
+**File:** `engine/nodes/subagent.py`
+**Issue:** Running the eval dashboard against "What course and resources to learn AI engineering?" produced `passed: False` with `ungrounded_count: 16` out of `total_findings: 59` (27%) — the actual failure driver (`failure_reasons: ["16 ungrounded claim(s)"]`). The same report also had 61 "uncited sentences" flagged, but per `eval/harness.py`/`eval/schema.py` that count is informational-only and doesn't affect `passed`.
+
+**Root cause:** The extraction prompt asked for "the exact quote or passage from the content that supports the claim", but `SUBAGENT_MODEL` (`gpt-5.4-nano`) sometimes paraphrases/condenses when extracting. `eval/grounding.py`'s check (exact substring after whitespace/case normalization, else fuzzy `difflib` window match ≥0.85) then can't locate the paraphrased span in the re-fetched page, so the finding is marked ungrounded — and nothing upstream caught this before the finding reached synthesis.
+
+**Fix (two-part):**
+1. Strengthened `_PROMPT` in `engine/nodes/subagent.py` to require a VERBATIM, character-for-character quote, kept short (ideally under 300 chars), and to drop a finding entirely if no exact quote supports it.
+2. Added a self-grounding-check filter in `subagent()`: after extraction, each finding is run through `eval.grounding.check_grounding` (the same lexical exact/fuzzy check the eval harness uses) against `content[:6_000]` — the same content the LLM saw. Findings that fail are dropped before they're added to `state.findings`, so an ungrounded `evidence_span` can never reach the report.
+
+**Result:** Not yet re-validated end-to-end (would require re-running research on this query); the fix reuses the eval harness's own grounding logic at extraction time, so it's expected to generalize to any future topic — `ungrounded_count` should trend toward 0 going forward.
+
+---
+
+### 10. Citations "fall off" partway through multi-sentence source descriptions
+**File:** `engine/nodes/synthesize.py`
+**Issue:** Many of the 61 informational "uncited sentences" from the same run were specific factual elaborations (e.g. a course's hours, cost, or prerequisites) immediately following a cited topic sentence about the same source — only the first sentence in the paragraph carried `[i]`, leaving the rest uncited even though they came from the same finding.
+
+**Fix:** Added a rule to the "Citation discipline" bullet in `_PROMPT`: when a paragraph describes one source's specifics across several sentences, attach `[i]` to each of those sentences, not just the first — only genuinely analytical/transition sentences (per Issue #8's rule) may stay uncited.

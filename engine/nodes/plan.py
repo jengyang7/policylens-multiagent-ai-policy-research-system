@@ -11,6 +11,7 @@ from engine.usage import usage_from_message
 
 class ResearchPlan(BaseModel):
     thinking: str  # Supervisor's brief reasoning about how to approach the query
+    title: str  # Short display title for this research (shown in UI instead of the raw query)
     subtasks: list[str]
 
 
@@ -20,7 +21,11 @@ _PROMPT = ChatPromptTemplate.from_messages([
         "You are a research planner. Given a research query:\n"
         "1. In 'thinking': write 2-3 sentences explaining your approach — what the user "
         "   wants, what key angles to cover, and why you chose these sub-questions.\n"
-        "2. In 'subtasks': decompose into 3–6 independent, specific sub-questions that "
+        "2. In 'title': write a short display title (3-6 words, title case, no trailing "
+        "   punctuation) that captures the topic of this research — this replaces the raw "
+        "   query in the UI, so make it read naturally as a heading "
+        "   (e.g. 'AI Engineering Learning Roadmap' rather than restating the question).\n"
+        "3. In 'subtasks': decompose into 3–6 independent, specific sub-questions that "
         "   together fully cover the topic. Each must be self-contained and directly "
         "   answerable via a web search. Do not overlap. Prefer concrete, searchable phrasing.",
     ),
@@ -40,6 +45,7 @@ def plan(state: ResearchState) -> dict:  # type: ignore[type-arg]
     usage = usage_from_message(raw["raw"], "plan", model)
     return {
         "subtasks": result.subtasks,
+        "title": result.title,
         "supervisor_thinking": result.thinking,
         "token_usage": [usage] if usage else [],
     }
