@@ -3,7 +3,7 @@ from logging.config import fileConfig
 
 from alembic import context
 from dotenv import load_dotenv
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import engine_from_config, pool, text
 
 load_dotenv()
 
@@ -54,8 +54,13 @@ def run_migrations_online() -> None:
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        connect_args={"connect_timeout": 10},
     )
     with connectable.connect() as connection:
+        # Fail fast (instead of hanging the whole deploy) if a DDL statement
+        # can't acquire its lock — e.g. a previous instance still holding open
+        # connections to a table being migrated during a rolling deploy.
+        connection.execute(text("SET lock_timeout = '10s'"))
         context.configure(
             connection=connection,
             target_metadata=target_metadata,

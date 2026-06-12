@@ -112,3 +112,15 @@ monkeypatch.setattr("engine.nodes.synthesize.ChatOpenAI", lambda **kw: mock_llm)
 **Issue:** Many of the 61 informational "uncited sentences" from the same run were specific factual elaborations (e.g. a course's hours, cost, or prerequisites) immediately following a cited topic sentence about the same source — only the first sentence in the paragraph carried `[i]`, leaving the rest uncited even though they came from the same finding.
 
 **Fix:** Added a rule to the "Citation discipline" bullet in `_PROMPT`: when a paragraph describes one source's specifics across several sentences, attach `[i]` to each of those sentences, not just the first — only genuinely analytical/transition sentences (per Issue #8's rule) may stay uncited.
+
+---
+
+### 11. Render deploy hung 15 minutes and timed out after a migration was added
+**File:** `db/migrations/env.py`
+**Issue:** After pushing the title-feature migration (`7a885b67938e_add_title_to_research_runs.py`), the Render deploy built successfully but then `uv run alembic upgrade head && uv run uvicorn ...` produced zero log output for ~15 minutes before Render's port-scan timeout killed the deploy entirely (full outage — old instance also torn down by the rolling deploy).
+
+**Root cause:** Postgres `lock_timeout` defaults to 0 (wait forever). `ALTER TABLE research_runs ADD COLUMN title` requires an `ACCESS EXCLUSIVE` lock; if any session (e.g. the previous instance's connection pool) still holds an open transaction touching `research_runs`, the `ALTER TABLE` blocks indefinitely with no error and no log output (Python stdout is fully buffered off a TTY, hiding even the startup log lines).
+
+**Fix:** In `db/migrations/env.py`'s `run_migrations_online()`, added `connect_args={"connect_timeout": 10}` to `engine_from_config` and `connection.execute(text("SET lock_timeout = '10s'"))` before `context.configure`. Now a blocked migration fails after 10s with a clear `QueryCanceled` error instead of hanging until Render's 15-minute port-scan timeout takes down the whole deploy.
+
+**Result:** Not yet validated against a real blocked-lock deploy; should make the next occurrence fail fast and visibly instead of causing a full outage.
