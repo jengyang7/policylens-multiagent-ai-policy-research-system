@@ -341,4 +341,4 @@ async def test_verify_citations_skips_when_no_findings_or_report() -> None:
     result = verify_citations(state)
     if hasattr(result, "__await__"):
         result = await result  # type: ignore[assignment]
-    assert result == {"findings": []}
+    assert result == {"report": "", "findings": []}

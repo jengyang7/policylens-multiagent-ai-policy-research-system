@@ -31,7 +31,10 @@ _PROMPT = ChatPromptTemplate.from_messages([
         "   meaningful is lost.\n"
         "3. In 'subtasks': decompose into 3–6 independent, specific sub-questions that "
         "   together fully cover the topic. Each must be self-contained and directly "
-        "   answerable via a web search. Do not overlap. Prefer concrete, searchable phrasing.",
+        "   answerable via a web search. Do not overlap. Prefer concrete, searchable "
+        "   phrasing. Each sub-question is sent VERBATIM to a web search engine as the "
+        "   query, so keep it short — one sentence, ideally under 20 words — and avoid "
+        "   stacking multiple clauses, comparisons, or caveats into a single sub-question.",
     ),
     ("human", "Research query: {query}"),
 ])

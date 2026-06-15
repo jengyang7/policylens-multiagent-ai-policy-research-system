@@ -270,7 +270,6 @@ function SubtaskCards({
           <span className="text-sm font-semibold text-gray-800">
             {heading} ({subtasks.length} question{subtasks.length !== 1 ? 's' : ''})
           </span>
-          {!allDone && <span className="ml-1"><Spinner /></span>}
           {allDone && totalFindings > 0 && (
             <span className="text-[11px] text-emerald-600 font-medium bg-emerald-50 border border-emerald-200 rounded-full px-2 py-0.5">
               {totalFindings} finding{totalFindings !== 1 ? 's' : ''}
@@ -332,17 +331,18 @@ function verdictWinnerLabel(winner: VerdictRow['winner']) {
 }
 
 function DebateBubble({
-  agent, round, modelLabel, content, streaming = false,
+  agent, round, modelLabel, content, streaming = false, thinking = false,
 }: {
   agent: DebateTurn['agent'];
   round: number;
   modelLabel: string;
   content: string;
   streaming?: boolean;
+  thinking?: boolean;
 }) {
   const isSkeptic = agent === 'skeptic';
   return (
-    <div className={`flex items-end gap-2 ${isSkeptic ? 'flex-row-reverse' : ''}`}>
+    <div className={`flex items-start gap-2 ${isSkeptic ? 'flex-row-reverse' : ''}`}>
       <div className={`w-7 h-7 rounded-full flex items-center justify-center text-[11px] font-bold flex-shrink-0 ${
         isSkeptic ? 'bg-amber-100 text-amber-700' : 'bg-blue-100 text-blue-700'
       }`}>
@@ -358,18 +358,28 @@ function DebateBubble({
             {isSkeptic ? 'Opposition' : 'Proposition'}
           </span>
           <span className="text-[11px] text-gray-400">
-            Round {round} · {modelLabel}{streaming ? ' · typing…' : ''}
+            {thinking
+              ? `${modelLabel} · thinking…`
+              : `Round ${round} · ${modelLabel}${streaming ? ' · typing…' : ''}`}
           </span>
         </div>
-        <div className="text-sm text-gray-700 leading-relaxed [&_p]:mb-2 [&_p:last-child]:mb-0
-          [&_strong]:font-semibold [&_strong]:text-gray-900
-          [&_a]:text-blue-600 [&_a:hover]:underline [&_a]:break-words
-          [&_ul]:list-disc [&_ul]:pl-5 [&_ul]:mb-2 [&_ol]:list-decimal [&_ol]:pl-5 [&_ol]:mb-2">
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
-          {streaming && (
-            <span className="inline-block w-1.5 h-3.5 bg-gray-400 animate-pulse rounded-sm" />
-          )}
-        </div>
+        {thinking ? (
+          <div className="flex items-center gap-1 py-0.5">
+            <span className="w-1.5 h-1.5 rounded-full bg-gray-400 animate-bounce [animation-delay:-0.3s]" />
+            <span className="w-1.5 h-1.5 rounded-full bg-gray-400 animate-bounce [animation-delay:-0.15s]" />
+            <span className="w-1.5 h-1.5 rounded-full bg-gray-400 animate-bounce" />
+          </div>
+        ) : (
+          <div className="text-sm text-gray-700 leading-relaxed [&_p]:mb-2 [&_p:last-child]:mb-0
+            [&_strong]:font-semibold [&_strong]:text-gray-900
+            [&_a]:text-blue-600 [&_a:hover]:underline [&_a]:break-words
+            [&_ul]:list-disc [&_ul]:pl-5 [&_ul]:mb-2 [&_ol]:list-decimal [&_ol]:pl-5 [&_ol]:mb-2">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+            {streaming && (
+              <span className="inline-block w-1.5 h-3.5 bg-gray-400 animate-pulse rounded-sm" />
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -621,6 +631,11 @@ export default function Home() {
   // while every question card already shows done.
   const stageProgress = useRef({ plan: { total: 0, done: 0 }, gap: { total: 0, done: 0 } });
 
+  // Mirrors of subtasks/gapSubtasks for handleEvent (same staleness issue as
+  // stageProgress above) — lets subtask_done look up "Subagent N" by question.
+  const subtasksRef = useRef<SubtaskState[]>([]);
+  const gapSubtasksRef = useRef<SubtaskState[]>([]);
+
   // Anonymous per-visitor id (no login) — scopes /runs and /eval/reports so
   // visitors only see their own data. Generated once and persisted locally.
   const [clientId, setClientId] = useState('');
@@ -842,10 +857,11 @@ export default function Home() {
   // Reflect the current step + progress in the browser tab title while a run
   // is in flight, so progress is visible even when this tab isn't focused.
   useEffect(() => {
+    const currentStep = log.length > 0 ? log[log.length - 1].label : milestones[milestoneIdx];
     document.title = phase === 'researching'
-      ? `${progressPct}% · ${milestones[milestoneIdx]} — MindClash`
+      ? `${progressPct}% · ${currentStep} — MindClash`
       : 'MindClash';
-  }, [phase, progressPct, milestones, milestoneIdx]);
+  }, [phase, progressPct, milestones, milestoneIdx, log]);
 
   const displayQuery = title || (query ? query.charAt(0).toUpperCase() + query.slice(1) : '');
 
@@ -879,7 +895,9 @@ export default function Home() {
     } else if (type === 'plan') {
       setPhase(p => (p === 'querying' ? 'researching' : p));
       const qs = (data.subtasks as string[]) ?? [];
-      setSubtasks(qs.map(q => ({ question: q, status: 'pending', findingsCount: 0 })));
+      const newSubtasks: SubtaskState[] = qs.map(q => ({ question: q, status: 'pending', findingsCount: 0 }));
+      setSubtasks(newSubtasks);
+      subtasksRef.current = newSubtasks;
       stageProgress.current.plan = { total: qs.length, done: 0 };
       const planTitle = data.title as string | undefined;
       if (planTitle) setTitle(planTitle);
@@ -889,11 +907,14 @@ export default function Home() {
       const srcs  = (data.sources as string[]) ?? [];
       const stage = data.stage === 'gap' ? 'gap' : 'plan';
       const markDone = (s: SubtaskState) => s.question === q ? { ...s, status: 'done' as const, findingsCount: count } : s;
+      const list = stage === 'gap' ? gapSubtasksRef.current : subtasksRef.current;
+      const idx = list.findIndex(s => s.question === q);
       if (stage === 'gap') setGapSubtasks(prev => prev.map(markDone));
       else setSubtasks(prev => prev.map(markDone));
       setSources(prev => { const set = new Set(prev); srcs.forEach(s => set.add(s)); return [...set]; });
-      const label = stage === 'gap' ? 'Follow-up Research Execution' : 'Research Execution';
-      addLog('subtask', label, `${count} finding${count !== 1 ? 's' : ''} · ${q.slice(0, 80)}${q.length > 80 ? '…' : ''}`, serverTs);
+      const subagentLabel = `${stage === 'gap' ? 'Gap Subagent' : 'Subagent'} ${idx + 1}`;
+      const label = stage === 'gap' ? 'Follow-up Research' : 'Research';
+      addLog('subtask', `${label} — ${subagentLabel}`, `${count} finding${count !== 1 ? 's' : ''} · ${q.slice(0, 80)}${q.length > 80 ? '…' : ''}`, serverTs);
       // Last question of the round done → compaction starts immediately, so log
       // it now: the execution step resolves the moment every card shows done.
       const sp = stageProgress.current[stage];
@@ -926,6 +947,7 @@ export default function Home() {
     } else if (type === 'judging') {
       setDebatingActive(false);
       setJudgingActive(true);
+      setDebateExpanded(false); // debate is over — collapse it so the verdict card takes the stage
       addLog('debate', 'Judging the Debate', 'A neutral judge (the lead model) is weighing both sides to declare a winner', serverTs);
     } else if (type === 'debate_verdict') {
       const winner = data.winner as DebateVerdict['winner'];
@@ -943,9 +965,12 @@ export default function Home() {
       addLog('plan', 'Identifying Evidence Gaps', 'Distilling unresolved objections from the debate into follow-up research questions', serverTs);
     } else if (type === 'gap_plan') {
       const qs = (data.subtasks as string[]) ?? [];
+      const newGapSubtasks: SubtaskState[] = qs.map(q => ({ question: q, status: 'pending', findingsCount: 0 }));
       setGapPlanningActive(false);
       setDebateExpanded(false); // debate is over — focus moves to the second finding round
-      setGapSubtasks(qs.map(q => ({ question: q, status: 'pending', findingsCount: 0 })));
+      setVerdictExpanded(false); // follow-up research is starting — verdict card steps aside
+      setGapSubtasks(newGapSubtasks);
+      gapSubtasksRef.current = newGapSubtasks;
       setGapCardsExpanded(true);
       stageProgress.current.gap = { total: qs.length, done: 0 };
       addLog('plan', 'Follow-up Research Plan', `${qs.length} gap question${qs.length !== 1 ? 's' : ''} from the debate`, serverTs);
@@ -1356,29 +1381,31 @@ export default function Home() {
                       </button>
                     </div>
                     {debateMode && (
-                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 px-4 pb-3 pt-2 border-t border-gray-100">
-                        <span className="hidden sm:block text-[11px] text-gray-400 mr-auto">
+                      <div className="flex flex-col gap-1.5 px-4 pb-3 pt-2 border-t border-gray-100">
+                        <span className="hidden sm:block text-[11px] text-gray-400 text-left">
                           Two agents from different AI companies debate the findings
                         </span>
-                        {/* Label + picker wrap together as one unit */}
-                        <span className="flex items-center gap-1 whitespace-nowrap">
-                          <span className="text-[11px] text-gray-400 font-medium">Proposition</span>
-                          <ModelPicker
-                            options={modelOptions}
-                            value={advocateModel}
-                            onChange={setAdvocateModel}
-                            disabled={phase === 'querying'}
-                          />
-                        </span>
-                        <span className="flex items-center gap-1 whitespace-nowrap">
-                          <span className="text-[11px] text-gray-400 font-medium">Opposition</span>
-                          <ModelPicker
-                            options={modelOptions}
-                            value={skepticModel}
-                            onChange={setSkepticModel}
-                            disabled={phase === 'querying'}
-                          />
-                        </span>
+                        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                          {/* Label + picker wrap together as one unit */}
+                          <span className="flex items-center gap-1 whitespace-nowrap">
+                            <span className="text-[11px] text-gray-400 font-medium">Proposition</span>
+                            <ModelPicker
+                              options={modelOptions}
+                              value={advocateModel}
+                              onChange={setAdvocateModel}
+                              disabled={phase === 'querying'}
+                            />
+                          </span>
+                          <span className="flex items-center gap-1 whitespace-nowrap">
+                            <span className="text-[11px] text-gray-400 font-medium">Opposition</span>
+                            <ModelPicker
+                              options={modelOptions}
+                              value={skepticModel}
+                              onChange={setSkepticModel}
+                              disabled={phase === 'querying'}
+                            />
+                          </span>
+                        </div>
                       </div>
                     )}
                   </div>
@@ -1705,14 +1732,6 @@ export default function Home() {
                     </div>
                   )}
 
-                  {/* Judging — the neutral lead weighs both sides after the final round */}
-                  {judgingActive && (
-                    <div className="flex items-center gap-2 text-sm text-gray-500">
-                      <Spinner />
-                      <span>🏆 The judge is weighing both sides of the debate…</span>
-                    </div>
-                  )}
-
                   {/* Gap planning — the lead distills debate objections into follow-up questions */}
                   {gapPlanningActive && (
                     <div className="flex items-center gap-2 text-sm text-gray-500">
@@ -1743,8 +1762,9 @@ export default function Home() {
                   />
                 )}
 
-                {/* Debate panel — visible while researching AND after completion */}
-                {(debateTurns.length > 0 || debateStreaming) && (
+                {/* Debate panel — appears as soon as the debate starts, visible while
+                    researching AND after completion */}
+                {(debatingActive || debateTurns.length > 0 || debateStreaming) && (
                   <div className="px-4 sm:px-6 lg:px-8 pt-4">
                     <div className="border border-rose-200 rounded-2xl overflow-hidden">
                       <button
@@ -1755,7 +1775,6 @@ export default function Home() {
                         <span className="text-sm font-semibold text-gray-800">
                           Debate ({debateTurns.length} turn{debateTurns.length !== 1 ? 's' : ''})
                         </span>
-                        {debatingActive && <span className="ml-1"><Spinner /></span>}
                         <svg
                           className={`w-4 h-4 text-gray-400 ml-auto transition-transform ${debateExpanded ? 'rotate-180' : ''}`}
                           fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
@@ -1786,6 +1805,26 @@ export default function Home() {
                               streaming
                             />
                           )}
+                          {debatingActive && !debateStreaming && (() => {
+                            // Between turns: whoever spoke last is about to receive a
+                            // rebuttal, so show the other side as waiting for their turn.
+                            // Proposition speaks first when nothing has happened yet.
+                            const activeAgent: DebateTurn['agent'] | null = debateTurns.length > 0
+                              ? debateTurns[debateTurns.length - 1].agent
+                              : null;
+                            const thinkingAgent: DebateTurn['agent'] = activeAgent === 'advocate' ? 'skeptic' : 'advocate';
+                            const id = thinkingAgent === 'advocate' ? advocateModel : skepticModel;
+                            const modelLabel = modelOptions.find(o => o.id === id)?.label ?? id;
+                            return (
+                              <DebateBubble
+                                agent={thinkingAgent}
+                                round={Math.floor(debateTurns.length / 2) + 1}
+                                modelLabel={modelLabel}
+                                content=""
+                                thinking
+                              />
+                            );
+                          })()}
                           <div ref={debateEndRef} />
                         </div>
                       )}
@@ -1793,10 +1832,11 @@ export default function Home() {
                   </div>
                 )}
 
-                {/* Judge's verdict — the neutral lead model's categorized call on who
-                    won, as a table. Collapsible; auto-collapses once the final
-                    report is ready so the report takes center stage. */}
-                {debateVerdict && (
+                {/* Judge's verdict card — appears as soon as judging starts (with a
+                    "thinking" placeholder) so the next step shows up instantly when
+                    the debate panel collapses, then fills in once the verdict arrives.
+                    Auto-collapses once the final report is ready. */}
+                {(judgingActive || debateVerdict) && (
                   <div className="px-4 sm:px-6 lg:px-8 pt-4">
                     <div className="border border-amber-200 rounded-2xl overflow-hidden">
                       <button
@@ -1805,17 +1845,21 @@ export default function Home() {
                       >
                         <span className="text-base">🏆</span>
                         <span className="text-sm font-semibold text-gray-800">Judge&apos;s Verdict</span>
-                        <span className={`text-[11px] font-semibold rounded-full px-2.5 py-0.5 border ${
-                          debateVerdict.winner === 'proposition'
-                            ? 'bg-blue-50 border-blue-200 text-blue-700'
-                            : debateVerdict.winner === 'opposition'
-                              ? 'bg-amber-100 border-amber-300 text-amber-800'
-                              : 'bg-gray-100 border-gray-300 text-gray-600'
-                        }`}>
-                          {debateVerdict.winner === 'draw' ? 'Draw' : `${verdictWinnerLabel(debateVerdict.winner)} wins`}
-                        </span>
+                        {debateVerdict ? (
+                          <span className={`text-[11px] font-semibold rounded-full px-2.5 py-0.5 border ${
+                            debateVerdict.winner === 'proposition'
+                              ? 'bg-blue-50 border-blue-200 text-blue-700'
+                              : debateVerdict.winner === 'opposition'
+                                ? 'bg-amber-100 border-amber-300 text-amber-800'
+                                : 'bg-gray-100 border-gray-300 text-gray-600'
+                          }`}>
+                            {debateVerdict.winner === 'draw' ? 'Draw' : `${verdictWinnerLabel(debateVerdict.winner)} wins`}
+                          </span>
+                        ) : null}
                         <span className="ml-auto flex items-center gap-2 text-[11px] text-gray-400">
-                          Judged by {modelOptions.find(o => o.id === debateVerdict.model)?.label ?? debateVerdict.model}
+                          {debateVerdict && (
+                            <>Judged by {modelOptions.find(o => o.id === debateVerdict.model)?.label ?? debateVerdict.model}</>
+                          )}
                           <svg
                             className={`w-4 h-4 text-gray-400 transition-transform ${verdictExpanded ? 'rotate-180' : ''}`}
                             fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
@@ -1825,36 +1869,42 @@ export default function Home() {
                         </span>
                       </button>
                       {verdictExpanded && (
-                        <div className="overflow-x-auto">
-                          <table className="w-full text-sm text-left border-collapse">
-                            <thead>
-                              <tr className="border-t border-amber-100 text-[11px] text-gray-400 uppercase tracking-wide">
-                                <th className="px-5 py-2 font-semibold">Category</th>
-                                <th className="px-5 py-2 font-semibold">Judge&apos;s Assessment</th>
-                                <th className="px-5 py-2 font-semibold whitespace-nowrap">Winner</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {debateVerdict.rows.map((row, i) => (
-                                <tr key={i} className="border-t border-amber-100">
-                                  <td className="px-5 py-2.5 font-medium text-gray-800 whitespace-nowrap">{row.category}</td>
-                                  <td className="px-5 py-2.5 text-gray-600">{row.assessment}</td>
-                                  <td className="px-5 py-2.5 whitespace-nowrap">
-                                    <span className={`text-[11px] font-semibold rounded-full px-2 py-0.5 border ${
-                                      row.winner === 'proposition'
-                                        ? 'bg-blue-50 border-blue-200 text-blue-700'
-                                        : row.winner === 'opposition'
-                                          ? 'bg-amber-100 border-amber-300 text-amber-800'
-                                          : 'bg-gray-100 border-gray-300 text-gray-600'
-                                    }`}>
-                                      {verdictWinnerLabel(row.winner)}
-                                    </span>
-                                  </td>
+                        debateVerdict ? (
+                          <div className="overflow-x-auto">
+                            <table className="w-full text-sm text-left border-collapse">
+                              <thead>
+                                <tr className="border-t border-amber-100 text-[11px] text-gray-400 uppercase tracking-wide">
+                                  <th className="px-5 py-2 font-semibold">Category</th>
+                                  <th className="px-5 py-2 font-semibold">Judge&apos;s Assessment</th>
+                                  <th className="px-5 py-2 font-semibold whitespace-nowrap">Winner</th>
                                 </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
+                              </thead>
+                              <tbody>
+                                {debateVerdict.rows.map((row, i) => (
+                                  <tr key={i} className="border-t border-amber-100">
+                                    <td className="px-5 py-2.5 font-medium text-gray-800 whitespace-nowrap">{row.category}</td>
+                                    <td className="px-5 py-2.5 text-gray-600">{row.assessment}</td>
+                                    <td className="px-5 py-2.5 whitespace-nowrap">
+                                      <span className={`text-[11px] font-semibold rounded-full px-2 py-0.5 border ${
+                                        row.winner === 'proposition'
+                                          ? 'bg-blue-50 border-blue-200 text-blue-700'
+                                          : row.winner === 'opposition'
+                                            ? 'bg-amber-100 border-amber-300 text-amber-800'
+                                            : 'bg-gray-100 border-gray-300 text-gray-600'
+                                      }`}>
+                                        {verdictWinnerLabel(row.winner)}
+                                      </span>
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        ) : (
+                          <div className="flex items-center gap-2 text-sm text-gray-400 px-5 py-4 border-t border-amber-100">
+                            <Spinner /> The judge is weighing both sides of the debate…
+                          </div>
+                        )
                       )}
                     </div>
                   </div>

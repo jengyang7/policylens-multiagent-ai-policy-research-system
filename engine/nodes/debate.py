@@ -199,10 +199,13 @@ def judge_debate(state: ResearchState) -> dict[str, object]:
         "transcript": format_transcript(state.get("debate_turns", [])),
     })
     assert isinstance(raw, dict)  # include_raw=True returns {"raw", "parsed", "parsing_error"}
-    result: DebateJudgment = raw["parsed"]
+    result: DebateJudgment | None = raw["parsed"]
     usage = usage_from_message(raw["raw"], "judge_debate", model)
-    rows = [row.model_dump() for row in result.rows]
-    verdict = DebateVerdict(rows=rows, winner=result.winner, model=model)  # type: ignore[arg-type]
+    # A parsing failure (model replied without the structured tool call) is rare
+    # but not fatal — fall back to an unscored draw rather than crashing the run.
+    rows = [row.model_dump() for row in result.rows] if result else []
+    winner = result.winner if result else "draw"
+    verdict = DebateVerdict(rows=rows, winner=winner, model=model)  # type: ignore[arg-type]
     return {"debate_verdict": verdict, "token_usage": [usage] if usage else []}
 
 
@@ -230,7 +233,9 @@ _GAP_PROMPT = ChatPromptTemplate.from_messages([
         f"- In 'gap_questions': write 0–{MAX_GAP_QUESTIONS} follow-up research "
         "questions targeting those gaps. Each must be self-contained, concrete, "
         "and directly answerable via a web search (name the specific data, "
-        "comparison, or timeframe needed).\n"
+        "comparison, or timeframe needed). Each question is sent VERBATIM to a web "
+        "search engine as the query, so keep it short — one sentence, ideally under "
+        "20 words.\n"
         "- Do NOT re-ask what the summary already answers, and do not restate "
         "debate rhetoric — only genuinely missing evidence qualifies.\n"
         "- If the debate surfaced no material gaps, return an empty list.",
@@ -256,9 +261,12 @@ def plan_gap_research(state: ResearchState) -> dict[str, object]:
         "transcript": format_transcript(state.get("debate_turns", [])),
     })
     assert isinstance(raw, dict)  # include_raw=True returns {"raw", "parsed", "parsing_error"}
-    result: GapResearchPlan = raw["parsed"]
+    result: GapResearchPlan | None = raw["parsed"]
     usage = usage_from_message(raw["raw"], "plan_gap_research", model)
+    # A parsing failure (model replied without the structured tool call) is rare
+    # but not fatal — treat it the same as "no material gaps" rather than crashing.
+    gap_questions = result.gap_questions[:MAX_GAP_QUESTIONS] if result else []
     return {
-        "gap_subtasks": result.gap_questions[:MAX_GAP_QUESTIONS],
+        "gap_subtasks": gap_questions,
         "token_usage": [usage] if usage else [],
     }

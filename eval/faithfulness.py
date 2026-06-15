@@ -117,10 +117,16 @@ async def run_faithfulness_checks(
         unresolved_index: int | None = None
         for index in indices:
             ref = citation_map.get(index)
-            if ref is None:
+            if ref is not None:
+                candidate_findings.extend(findings_by_url.get(ref.url, []))
+            elif 1 <= index <= len(findings):
+                # The synthesizer's own References list omitted (or never wrote)
+                # this index — fall back to the same 1-indexed mapping into
+                # `findings` that _rebuild_references uses, so a missing/
+                # malformed References section doesn't auto-fail every citation.
+                candidate_findings.append(findings[index - 1])
+            else:
                 unresolved_index = index
-                continue
-            candidate_findings.extend(findings_by_url.get(ref.url, []))
 
         if not candidate_findings:
             reasoning = (

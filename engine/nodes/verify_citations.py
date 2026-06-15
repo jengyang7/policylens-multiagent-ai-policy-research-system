@@ -100,7 +100,7 @@ async def verify_citations(state: ResearchState) -> dict[str, object]:
     report = state.get("report", "")
     findings = state.get("findings", [])
     if not report or not findings:
-        return {"findings": []}
+        return {"report": report, "findings": []}
 
     verdicts, _uncited, token_usage = await run_faithfulness_checks(
         report, findings, lead_model=CITATION_CHECK_MODEL

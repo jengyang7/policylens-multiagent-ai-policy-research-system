@@ -13,7 +13,13 @@ import re
 from eval.schema import CitationRef
 
 _REFERENCES_HEADER_RE = re.compile(r"^#{1,6}\s*References\s*$", re.IGNORECASE | re.MULTILINE)
-_REF_LINE_RE = re.compile(r"^\s*\[(\d+)\]\s*\[([^\]]*)\]\(([^)]+)\)\s*$", re.MULTILINE)
+# The synthesize prompt asks for "[1] [Title](url)" lines, but models often
+# "prettify" that into a standard numbered markdown list ("1. [Title](url)")
+# instead — accept both so a stylistic drift doesn't blank out the whole
+# References section (every citation would otherwise resolve to nothing).
+_REF_LINE_RE = re.compile(
+    r"^\s*(?:\[(\d+)\]|(\d+)[.)])\s*\[([^\]]*)\]\(([^)]+)\)\s*$", re.MULTILINE
+)
 _CITATION_MARKER_RE = re.compile(r"\[(\d+)\]")
 _HEADER_LINE_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 _BULLET_LINE_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+(.*)$")
@@ -43,8 +49,8 @@ def parse_references(report: str) -> dict[int, CitationRef]:
     text = references_section or report
     refs: dict[int, CitationRef] = {}
     for m in _REF_LINE_RE.finditer(text):
-        index = int(m.group(1))
-        refs[index] = CitationRef(index=index, title=m.group(2).strip(), url=m.group(3).strip())
+        index = int(m.group(1) or m.group(2))
+        refs[index] = CitationRef(index=index, title=m.group(3).strip(), url=m.group(4).strip())
     return refs
 
 
