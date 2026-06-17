@@ -57,16 +57,14 @@ def run_migrations_online() -> None:
         connect_args={"connect_timeout": 10},
     )
     with connectable.connect() as connection:
-        # Fail fast (instead of hanging the whole deploy) if a DDL statement
-        # can't acquire its lock — e.g. a previous instance still holding open
-        # connections to a table being migrated during a rolling deploy.
-        connection.execute(text("SET lock_timeout = '10s'"))
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
             include_object=_include_object,
         )
         with context.begin_transaction():
+            # Fail fast if a DDL statement can't acquire its lock.
+            connection.execute(text("SET lock_timeout = '10s'"))
             context.run_migrations()
 
 
