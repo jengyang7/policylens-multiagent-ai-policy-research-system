@@ -17,6 +17,11 @@ dependencies = [
     "alembic>=1.14",
     "asyncpg>=0.30",       # async driver (runtime)
     "psycopg[binary]>=3.2",  # sync driver (alembic + langgraph checkpointer)
+    # LlamaIndex RAG pipeline — chunking, embedding, vector store, LLM (Layer 4 only)
+    "llama-index-core>=0.12",
+    "llama-index-embeddings-openai>=0.3",
+    "llama-index-llms-openai>=0.3",
+    "llama-index-vector-stores-postgres>=0.3",
     # Tools
     "httpx>=0.27",
     "beautifulsoup4>=4.12",

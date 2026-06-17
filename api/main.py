@@ -1,6 +1,7 @@
 """FastAPI server: POST /research (SSE), POST /runs/{id}/resume, GET /runs/{id}, POST /chat."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -18,10 +19,12 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 from pydantic import BaseModel
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sse_starlette.sse import EventSourceResponse
 
-from db.models import EvalReportRecord, ResearchRun
+from db.models import EvalReportRecord, Report, ResearchRun
+from engine.memory import rag
 from engine.memory.checkpointer import get_checkpointer
 from engine.models import LEAD_MODEL, LEAD_MODEL_OPTIONS, SUBAGENT_MODEL, estimate_cost_usd
 from engine.nodes.chat import answer_followup
@@ -116,6 +119,11 @@ class ChatRequest(BaseModel):
     history: list[dict[str, str]] = []
 
 
+class LibraryChatRequest(BaseModel):
+    question: str
+    history: list[dict[str, str]] = []
+
+
 # ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
@@ -155,6 +163,30 @@ def _eval_record_summary(record: EvalReportRecord) -> dict[str, object]:
         "recall_score": record.recall_score,
         "relevance_score": record.relevance_score,
     }
+
+
+# ---------------------------------------------------------------------------
+# Report persistence + RAG ingest (Layer 4: long-term memory)
+# ---------------------------------------------------------------------------
+
+async def _save_and_embed_report(run_id: str, content: str) -> None:
+    """Persist report to DB and index via LlamaIndex for RAG (Layer 4 long-term memory)."""
+    assert _session_factory is not None
+    async with _session_factory() as session:
+        stmt = (
+            pg_insert(Report)
+            .values(id=str(uuid.uuid4()), run_id=run_id, content=content)
+            .on_conflict_do_update(index_elements=["run_id"], set_={"content": content})
+        )
+        await session.execute(stmt)
+        await session.commit()
+        # Fetch run metadata so LlamaIndex can store it as node metadata for citations
+        result = await session.execute(select(ResearchRun).where(ResearchRun.id == run_id))
+        run = result.scalar_one_or_none()
+
+    title = (run.title or run.query) if run else run_id
+    query = run.query if run else ""
+    await rag.embed_and_store(run_id, content, title, query)
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +255,9 @@ async def _stream_graph(
 
                 elif node_name == "verify_citations":
                     report: str = node_output.get("report", "")  # type: ignore[union-attr]
+                    if report:
+                        # Persist to DB + embed in background — don't block the SSE stream
+                        asyncio.create_task(_save_and_embed_report(run_id, report))
                     yield _evt({"type": "report", "content": report, "run_id": run_id})
 
         # After the loop: detect interrupt (clarification needed) vs normal completion.
@@ -587,6 +622,46 @@ async def chat(body: ChatRequest) -> EventSourceResponse:
             ):
                 yield _evt({"type": "chunk", "content": chunk})
             yield _evt({"type": "done"})
+        except Exception as exc:
+            yield _evt({"type": "error", "message": str(exc)})
+
+    return EventSourceResponse(stream())
+
+
+@app.post("/library/chat")
+async def library_chat(body: LibraryChatRequest) -> EventSourceResponse:
+    """RAG chatbot over all completed research reports (Layer 4: long-term memory)."""
+    assert _session_factory is not None
+
+    async def stream() -> AsyncGenerator[dict[str, str], None]:
+        try:
+            yield _evt({"type": "searching"})
+            chunks = await rag.search(body.question)
+
+            # Emit retrieved chunks so the UI can show them in the sidebar
+            yield _evt({
+                "type": "chunks_retrieved",
+                "chunks": [
+                    {"content": str(c["content"]), "title": str(c["title"]), "run_id": str(c["run_id"])}
+                    for c in chunks
+                ],
+            })
+
+            # Deduplicate sources by run_id for the citation list
+            seen: set[str] = set()
+            sources: list[dict[str, str]] = []
+            for c in chunks:
+                rid = str(c["run_id"])
+                if rid not in seen:
+                    seen.add(rid)
+                    sources.append(
+                        {"run_id": rid, "title": str(c["title"]), "query": str(c["query"])}
+                    )
+
+            yield _evt({"type": "generating"})
+            async for token in rag.answer_with_context(body.question, body.history, chunks):
+                yield _evt({"type": "chunk", "content": token})
+            yield _evt({"type": "done", "sources": sources})
         except Exception as exc:
             yield _evt({"type": "error", "message": str(exc)})
 

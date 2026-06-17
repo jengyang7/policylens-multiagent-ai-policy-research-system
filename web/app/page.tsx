@@ -9,9 +9,14 @@ const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
 
 type Phase = 'idle' | 'querying' | 'clarifying' | 'researching' | 'done' | 'error';
 type LogType = 'start' | 'plan' | 'subtask' | 'synthesis' | 'report' | 'complete' | 'clarify' | 'error';
+type LibrarySource    = { run_id: string; title: string; query: string };
+type LibraryStepType  = 'searching' | 'chunks_retrieved' | 'generating' | 'done' | 'error';
+interface LibraryStep  { id: number; type: LibraryStepType; label: string; detail?: string; ts: string; }
+interface RetrievedChunk { content: string; title: string; run_id: string; }
 
 interface SubtaskState { question: string; status: 'pending' | 'done'; findingsCount: number; }
 interface ChatMessage  { role: 'user' | 'assistant'; content: string; }
+interface LibraryChatMessage { role: 'user' | 'assistant'; content: string; sources?: LibrarySource[]; }
 interface LogEntry     { id: number; type: LogType; label: string; detail?: string; ts: string; createdAt: number; serverTs?: number; }
 interface ModelOption  { id: string; label: string; description: string; }
 
@@ -230,20 +235,22 @@ function TrashIcon() {
 }
 
 function Sidebar({
-  history, activeId, locked, mobileOpen, view, onNewResearch, onShowEvalDashboard, onSelect, onDelete, onClose,
+  history, activeId, locked, mobileOpen, view, onNewResearch, onShowEvalDashboard, onShowLibrary, onSelect, onDelete, onClose,
 }: {
   history: HistoryEntry[];
   activeId: string | null;
   locked: boolean;
   mobileOpen: boolean;
-  view: 'research' | 'eval';
+  view: 'research' | 'eval' | 'library';
   onNewResearch: () => void;
   onShowEvalDashboard: () => void;
+  onShowLibrary: () => void;
   onSelect: (entry: HistoryEntry) => void;
   onDelete: (id: string, e: React.MouseEvent) => void;
   onClose: () => void;
 }) {
   const evalActive = view === 'eval';
+  const libraryActive = view === 'library';
   const newResearchActive = view === 'research' && activeId === null;
   return (
     <>
@@ -291,6 +298,21 @@ function Sidebar({
             <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
           </svg>
           New Research
+        </button>
+
+        {/* Research Library */}
+        <button
+          onClick={onShowLibrary}
+          className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl border font-semibold transition-colors text-sm ${
+            libraryActive
+              ? 'bg-white border-gray-200 text-gray-900 shadow-sm'
+              : 'bg-transparent border-transparent text-gray-500 hover:bg-gray-100 hover:text-gray-800'
+          }`}
+        >
+          <svg className="w-[18px] h-[18px] flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M8 14v3m4-3v3m4-3v3M3 21h18M3 10h18M3 7l9-4 9 4M4 10h16v11H4V10z" />
+          </svg>
+          Research Library
         </button>
 
         {/* Eval Dashboard */}
@@ -392,8 +414,16 @@ export default function Home() {
   const [history,  setHistory]  = useState<HistoryEntry[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
 
-  // Top-level view: research flow (default) vs the persisted eval dashboard
-  const [view, setView] = useState<'research' | 'eval'>('research');
+  const [libraryChatMessages,  setLibraryChatMessages]  = useState<LibraryChatMessage[]>([]);
+  const [libraryChatInput,     setLibraryChatInput]     = useState('');
+  const [libraryChatStreaming, setLibraryChatStreaming] = useState(false);
+  const [librarySteps,         setLibrarySteps]         = useState<LibraryStep[]>([]);
+  const [libraryChunks,        setLibraryChunks]        = useState<RetrievedChunk[]>([]);
+  const [libraryRightTab,      setLibraryRightTab]      = useState<'steps' | 'chunks'>('steps');
+  const [showLibraryActivityMobile, setShowLibraryActivityMobile] = useState(false);
+
+  // Top-level view: research flow (default) vs eval dashboard vs RAG library
+  const [view, setView] = useState<'research' | 'eval' | 'library'>('research');
 
   // Mobile-only UI state: off-canvas sidebar drawer + collapsible activity panel
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -676,6 +706,66 @@ export default function Home() {
     } finally { setChatStreaming(false); }
   }
 
+  async function sendLibraryChat() {
+    const q = libraryChatInput.trim();
+    if (!q || libraryChatStreaming) return;
+    setLibraryChatInput('');
+    setLibraryChatStreaming(true);
+    setLibrarySteps([]);
+    setLibraryChunks([]);
+    setLibraryRightTab('steps');
+    const historySnap = [...libraryChatMessages];
+    setLibraryChatMessages(prev => [...prev, { role: 'user', content: q }, { role: 'assistant', content: '' }]);
+    let reply = '';
+    let stepId = 0;
+    const addStep = (type: LibraryStepType, label: string, detail?: string) =>
+      setLibrarySteps(prev => [...prev, { id: ++stepId, type, label, detail, ts: nowTs() }]);
+    try {
+      const res = await fetch(`${API}/library/chat`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          question: q,
+          history: historySnap.map(m => ({ role: m.role, content: m.content })),
+        }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      let finalSources: LibrarySource[] = [];
+      await readStream(res, data => {
+        if (data.type === 'searching') {
+          addStep('searching', 'Searching Reports', 'Embedding question and running cosine similarity across all indexed reports…');
+        } else if (data.type === 'chunks_retrieved') {
+          const chunks = (data.chunks as RetrievedChunk[]) ?? [];
+          setLibraryChunks(chunks);
+          const titles = [...new Set(chunks.map(c => c.title))];
+          addStep('chunks_retrieved', `${chunks.length} Chunks Retrieved`,
+            titles.length ? `From: ${titles.join(', ')}` : undefined);
+        } else if (data.type === 'generating') {
+          addStep('generating', 'Generating Answer', 'Writing response grounded in retrieved context…');
+        } else if (data.type === 'chunk') {
+          reply += data.content as string;
+          setLibraryChatMessages(prev => [
+            ...prev.slice(0, -1),
+            { role: 'assistant', content: reply, sources: finalSources },
+          ]);
+        } else if (data.type === 'done') {
+          finalSources = (data.sources as LibrarySource[]) ?? [];
+          addStep('done', 'Complete');
+          setLibraryChatMessages(prev => [
+            ...prev.slice(0, -1),
+            { role: 'assistant', content: reply, sources: finalSources },
+          ]);
+        } else if (data.type === 'error') {
+          addStep('error', 'Error', data.message as string);
+        }
+      });
+    } catch (e) {
+      setLibraryChatMessages(prev => [
+        ...prev.slice(0, -1),
+        { role: 'assistant', content: `Error: ${String(e)}` },
+      ]);
+    } finally { setLibraryChatStreaming(false); }
+  }
+
   function reset() {
     setPhase('idle'); setQuery(''); setSubtasks([]); setSources([]);
     setReport(''); setShowReport(false); setChatMessages([]);
@@ -686,6 +776,7 @@ export default function Home() {
     setClarifyQuestions([]); setClarifyOptions([]); setClarifyAnswers([]);
     setActiveId(null);
     setView('research');
+    setLibraryChatMessages([]); setLibraryChatInput('');
   }
 
   // Switch the main view to a past research session from the sidebar
@@ -735,6 +826,7 @@ export default function Home() {
         view={view}
         onNewResearch={() => { reset(); setSidebarOpen(false); }}
         onShowEvalDashboard={() => { setView('eval'); setSidebarOpen(false); }}
+        onShowLibrary={() => { setView('library'); setSidebarOpen(false); }}
         onSelect={entry => { selectEntry(entry); setSidebarOpen(false); }}
         onDelete={deleteEntry}
         onClose={() => setSidebarOpen(false)}
@@ -756,6 +848,231 @@ export default function Home() {
 
         {/* ═══════════ EVAL DASHBOARD ═══════════ */}
         {view === 'eval' && <EvalDashboard apiBase={API} clientId={clientId} />}
+
+        {/* ═══════════ RESEARCH LIBRARY (RAG) ═══════════ */}
+        {view === 'library' && (
+          <div className="flex-1 flex flex-col min-h-0">
+
+            {/* Header */}
+            <div className="flex-shrink-0 h-12 border-b border-gray-200 flex items-center gap-3 px-4 sm:px-6">
+              <svg className="w-4 h-4 text-indigo-500 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M8 14v3m4-3v3m4-3v3M3 21h18M3 10h18M3 7l9-4 9 4M4 10h16v11H4V10z" />
+              </svg>
+              <span className="text-sm font-semibold text-gray-800">Research Library</span>
+              <span className="hidden sm:inline text-xs text-gray-400">· Ask questions across all your past research</span>
+              <div className="ml-auto">
+                <button
+                  onClick={() => setShowLibraryActivityMobile(v => !v)}
+                  className="lg:hidden flex items-center gap-1.5 text-xs font-medium text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded-lg px-2.5 py-1.5 transition-colors"
+                >
+                  {showLibraryActivityMobile ? 'Hide Panel' : 'Show Panel'}
+                </button>
+              </div>
+            </div>
+
+            {/* Split: chat left + retrieval panel right */}
+            <div className="flex-1 flex flex-col lg:flex-row min-h-0">
+
+              {/* ── Chat column ── */}
+              <div className={`flex-1 min-h-0 flex-col min-w-0 ${showLibraryActivityMobile ? 'hidden lg:flex' : 'flex'}`}>
+                {/* Chat messages */}
+                <div className="flex-1 overflow-y-auto px-4 sm:px-6 py-6 space-y-3">
+                  {libraryChatMessages.length === 0 ? (
+                    <div className="flex flex-col items-center justify-center h-full gap-4 text-center">
+                      <div className="w-14 h-14 rounded-2xl bg-indigo-50 border border-indigo-100 flex items-center justify-center">
+                        <svg className="w-7 h-7 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M8 14v3m4-3v3m4-3v3M3 21h18M3 10h18M3 7l9-4 9 4M4 10h16v11H4V10z" />
+                        </svg>
+                      </div>
+                      <div>
+                        <p className="text-sm font-semibold text-gray-800">Ask your research library</p>
+                        <p className="text-xs text-gray-400 mt-1 max-w-xs">
+                          Questions are answered using relevant passages retrieved from all your completed research reports.
+                        </p>
+                      </div>
+                      <div className="flex flex-col gap-1.5 text-left w-full max-w-sm">
+                        {[
+                          'What have I researched about AI trends?',
+                          'Summarize findings on market analysis topics',
+                          'What sources did my research cite most?',
+                        ].map(prompt => (
+                          <button
+                            key={prompt}
+                            onClick={() => { setLibraryChatInput(prompt); }}
+                            className="text-left text-xs text-gray-600 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 hover:border-indigo-300 hover:bg-indigo-50 hover:text-indigo-700 transition-colors"
+                          >
+                            {prompt}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    libraryChatMessages.map((m, i) => (
+                      <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                        <div className={`text-sm rounded-xl px-4 py-2.5 max-w-[85%] sm:max-w-[75%] ${
+                          m.role === 'user' ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-800'
+                        }`}>
+                          {m.role === 'assistant' ? (
+                            m.content ? (
+                              <>
+                                <div className="[&_a]:text-indigo-600 [&_a:hover]:underline [&_p]:mb-2 [&_p:last-child]:mb-0
+                                  [&_ul]:list-disc [&_ul]:pl-4 [&_ul]:mb-2 [&_ul]:space-y-1
+                                  [&_ol]:list-decimal [&_ol]:pl-4 [&_ol]:mb-2 [&_ol]:space-y-1
+                                  [&_li]:leading-relaxed [&_strong]:font-semibold [&_strong]:text-gray-900
+                                  [&_code]:bg-gray-200 [&_code]:px-1 [&_code]:rounded text-xs leading-relaxed">
+                                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
+                                </div>
+                                {m.sources && m.sources.length > 0 && (
+                                  <div className="mt-2.5 pt-2 border-t border-gray-200 space-y-0.5">
+                                    <p className="text-[10px] uppercase tracking-wide text-gray-400 font-medium mb-1">Sources</p>
+                                    {m.sources.map((s, j) => (
+                                      <p key={j} className="text-[11px] text-gray-500 truncate">
+                                        · {s.title || s.query}
+                                      </p>
+                                    ))}
+                                  </div>
+                                )}
+                              </>
+                            ) : (
+                              <span className="flex items-center gap-1.5 text-gray-400 text-xs">
+                                <Spinner /> Searching reports…
+                              </span>
+                            )
+                          ) : m.content}
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+
+                {/* Input */}
+                <div className="flex-shrink-0 border-t border-gray-200 px-4 sm:px-6 py-4">
+                  <div className="flex gap-2">
+                    <input
+                      value={libraryChatInput}
+                      onChange={e => setLibraryChatInput(e.target.value)}
+                      onKeyDown={e => e.key === 'Enter' && !e.shiftKey && sendLibraryChat()}
+                      placeholder="Ask anything across your past research…"
+                      disabled={libraryChatStreaming}
+                      className="flex-1 border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-indigo-400 disabled:bg-gray-50"
+                    />
+                    <button
+                      onClick={sendLibraryChat}
+                      disabled={!libraryChatInput.trim() || libraryChatStreaming}
+                      className="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white rounded-xl px-4 py-2.5 text-sm font-semibold transition-colors"
+                    >
+                      {libraryChatStreaming ? <Spinner /> : <SendIcon />}
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* ── Right panel: Steps + Chunks ── */}
+              <div className={`min-h-0 w-full lg:w-[300px] flex-1 lg:flex-none border-t lg:border-t-0 lg:border-l border-gray-200 bg-gray-50 flex-col ${showLibraryActivityMobile ? 'flex' : 'hidden lg:flex'}`}>
+                {/* Tab bar */}
+                <div className="flex border-b border-gray-200 text-xs font-semibold flex-shrink-0">
+                  {(['steps', 'chunks'] as const).map(tab => (
+                    <button
+                      key={tab}
+                      onClick={() => setLibraryRightTab(tab)}
+                      className={`flex-1 py-3 flex items-center justify-center gap-1.5 transition-colors ${
+                        libraryRightTab === tab
+                          ? 'text-indigo-600 border-b-2 border-indigo-500 bg-white'
+                          : 'text-gray-400 hover:text-gray-700'
+                      }`}
+                    >
+                      {tab === 'steps' ? (
+                        <>
+                          <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+                          </svg>
+                          Steps
+                        </>
+                      ) : (
+                        <>
+                          <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                          </svg>
+                          {`Chunks${libraryChunks.length ? ` (${libraryChunks.length})` : ''}`}
+                        </>
+                      )}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Tab content */}
+                {libraryRightTab === 'steps' ? (
+                  <div className="flex-1 overflow-y-auto">
+                    {librarySteps.length === 0 ? (
+                      <p className="text-xs text-gray-400 text-center pt-8 px-4">
+                        Steps will appear here when you ask a question.
+                      </p>
+                    ) : (
+                      <div className="relative px-3 py-3">
+                        <div className="absolute left-[27px] top-6 bottom-6 w-0.5 bg-gradient-to-b from-indigo-300 via-violet-300 to-emerald-300 opacity-50" />
+                        {librarySteps.map(step => {
+                          const iconColor = step.type === 'done'
+                            ? 'bg-emerald-500'
+                            : step.type === 'error'
+                            ? 'bg-red-500'
+                            : step.type === 'searching'
+                            ? 'bg-indigo-500'
+                            : step.type === 'chunks_retrieved'
+                            ? 'bg-violet-500'
+                            : 'bg-blue-500';
+                          return (
+                            <div key={step.id} className="flex gap-3 py-2.5 relative">
+                              <div className="flex-shrink-0 z-10">
+                                <div className={`w-5 h-5 rounded-full ${iconColor} flex items-center justify-center`}>
+                                  <div className="w-2 h-2 rounded-full bg-white" />
+                                </div>
+                              </div>
+                              <div className="flex-1 min-w-0 bg-white border border-gray-200 rounded-xl px-3 py-2.5 shadow-sm">
+                                <div className="flex items-start justify-between gap-2 mb-1">
+                                  <span className="text-xs font-semibold text-gray-800 leading-tight">{step.label}</span>
+                                  <span className="text-[10px] text-gray-400 flex-shrink-0 whitespace-nowrap font-mono">{step.ts}</span>
+                                </div>
+                                {step.detail && (
+                                  <p className="text-[11px] text-gray-500 leading-relaxed">{step.detail}</p>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="flex-1 overflow-y-auto">
+                    {libraryChunks.length === 0 ? (
+                      <p className="text-xs text-gray-400 text-center pt-8 px-4">
+                        Retrieved chunks will appear here after a query.
+                      </p>
+                    ) : (
+                      <div className="px-3 py-3 space-y-2.5">
+                        {libraryChunks.map((chunk, i) => (
+                          <div key={i} className="bg-white border border-gray-200 rounded-xl px-3 py-2.5 shadow-sm">
+                            <div className="flex items-center gap-1.5 mb-1.5">
+                              <span className="text-[10px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-1.5 py-0.5">
+                                #{i + 1}
+                              </span>
+                              <span className="text-[11px] font-semibold text-gray-700 truncate">
+                                {chunk.title || 'Untitled Report'}
+                              </span>
+                            </div>
+                            <p className="text-[11px] text-gray-500 leading-relaxed line-clamp-4">
+                              {chunk.content}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* ═══════════ IDLE / QUERYING / CLARIFYING / ERROR ═══════════ */}
         {view === 'research' && (phase === 'idle' || phase === 'querying' || phase === 'clarifying' || phase === 'error') && (
