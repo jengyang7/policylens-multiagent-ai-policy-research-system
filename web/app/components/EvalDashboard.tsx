@@ -26,15 +26,6 @@ interface RunSummary {
   stats: RunStats | null;
 }
 
-interface GlobalSummary {
-  runs_evaluated: number;
-  pass_rate: number | null;
-  grounding_rate: number | null;
-  faithfulness_rate: number | null;
-  completeness_rate: number | null;
-  relevance_score: number | null;
-}
-
 // Counts needed to derive grounding/faithfulness rate — shared by per-run
 // reports and the unscoped community trend points.
 interface RateCounts {
@@ -477,7 +468,6 @@ function DetailPanel({ detail, loading }: { detail: EvalReportDetail | null; loa
 export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; clientId: string }) {
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [reports, setReports] = useState<EvalReportSummary[]>([]);
-  const [globalSummary, setGlobalSummary] = useState<GlobalSummary | null>(null);
   const [communityTrend, setCommunityTrend] = useState<CommunityTrendPoint[]>([]);
   const [loading, setLoading] = useState(true);
   const [errorMsg, setErrorMsg] = useState('');
@@ -485,10 +475,7 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
   const [selectedReportId, setSelectedReportId] = useState<string | null>(null);
   const [detail, setDetail] = useState<EvalReportDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
-  const [clearing, setClearing] = useState(false);
-  const [communityClearing, setCommunityClearing] = useState(false);
   const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
-  const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Custom confirmation modal (replaces window.confirm for destructive actions)
   const [confirmDialog, setConfirmDialog] = useState<{
@@ -520,16 +507,14 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
     setLoading(true);
     setErrorMsg('');
     try {
-      const [runsRes, reportsRes, globalRes, trendRes] = await Promise.all([
+      const [runsRes, reportsRes, trendRes] = await Promise.all([
         fetch(`${apiBase}/runs?status=done`, { headers }),
         fetch(`${apiBase}/eval/reports`, { headers }),
-        fetch(`${apiBase}/eval/summary`),
         fetch(`${apiBase}/eval/reports/community`),
       ]);
-      if (!runsRes.ok || !reportsRes.ok || !globalRes.ok || !trendRes.ok) throw new Error('Failed to load eval data');
+      if (!runsRes.ok || !reportsRes.ok || !trendRes.ok) throw new Error('Failed to load eval data');
       setRuns(await runsRes.json());
       setReports(await reportsRes.json());
-      setGlobalSummary(await globalRes.json());
       setCommunityTrend(await trendRes.json());
     } catch (e) {
       setErrorMsg(String(e));
@@ -608,31 +593,6 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
     }
   }
 
-  async function clearAll() {
-    setClearing(true);
-    setErrorMsg('');
-    try {
-      const res = await fetch(`${apiBase}/eval/reports`, { method: 'DELETE', headers });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      setSelectedReportId(null);
-      setDetail(null);
-      await load();
-    } catch (e) {
-      setErrorMsg(String(e));
-    } finally {
-      setClearing(false);
-    }
-  }
-
-  function confirmClearAll() {
-    setConfirmDialog({
-      title: 'Clear my data?',
-      message: 'This deletes all of your eval history. This cannot be undone.',
-      confirmLabel: 'Clear my data',
-      onConfirm: clearAll,
-    });
-  }
-
   async function deleteRun(runId: string) {
     setDeletingRunId(runId);
     setErrorMsg('');
@@ -660,42 +620,6 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
     });
   }
 
-  // Secret long-press on "Community Average" — prompts for the admin secret and
-  // wipes every visitor's eval reports via DELETE /eval/reports/community.
-  async function clearCommunityAverage() {
-    const secret = window.prompt('Admin secret to reset the community average:');
-    if (!secret) return;
-    setCommunityClearing(true);
-    setErrorMsg('');
-    try {
-      const res = await fetch(`${apiBase}/eval/reports/community`, {
-        method: 'DELETE',
-        headers: { 'X-Admin-Secret': secret },
-      });
-      if (!res.ok) throw new Error(res.status === 404 ? 'Invalid admin secret' : `HTTP ${res.status}`);
-      await load();
-    } catch (e) {
-      setErrorMsg(String(e));
-    } finally {
-      setCommunityClearing(false);
-    }
-  }
-
-  function startLongPress() {
-    if (longPressTimer.current) clearTimeout(longPressTimer.current);
-    longPressTimer.current = setTimeout(() => {
-      longPressTimer.current = null;
-      clearCommunityAverage();
-    }, 1500);
-  }
-
-  function cancelLongPress() {
-    if (longPressTimer.current) {
-      clearTimeout(longPressTimer.current);
-      longPressTimer.current = null;
-    }
-  }
-
   return (
     <div className="flex-1 overflow-y-auto">
     <div className="p-4 sm:p-6 space-y-6 max-w-5xl mx-auto w-full">
@@ -706,15 +630,7 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
             Citation grounding &amp; faithfulness checks across completed research runs.
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={confirmClearAll}
-            disabled={clearing || reports.length === 0}
-            className="text-xs font-semibold text-red-600 hover:text-red-700 disabled:opacity-40 transition-colors px-2.5 py-1.5 rounded-lg border border-red-200 hover:bg-red-50"
-          >
-            {clearing ? 'Clearing…' : 'Clear My Data'}
-          </button>
-        </div>
+        <div />
       </div>
 
       {errorMsg && (
@@ -729,9 +645,9 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
         </div>
       ) : (
         <>
-          {/* Your stats */}
+          {/* Stats */}
           <div>
-            <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-2">Your Stats</p>
+            <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-2">Stats</p>
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
               <div className="bg-white border border-gray-200 rounded-xl shadow-sm px-4 py-3">
                 <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold">Runs Evaluated</p>
@@ -764,52 +680,7 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
             </div>
           </div>
 
-          {/* Community average — aggregated across all visitors, read-only.
-              Long-press the label for the hidden admin reset. */}
-          <div>
-            <p
-              className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-2 select-none"
-              onMouseDown={startLongPress}
-              onMouseUp={cancelLongPress}
-              onMouseLeave={cancelLongPress}
-              onTouchStart={startLongPress}
-              onTouchEnd={cancelLongPress}
-              title={communityClearing ? 'Resetting…' : undefined}
-            >
-              Community Average
-              <span className="normal-case text-gray-400 font-normal">
-                {' '}— based on{' '}
-                {globalSummary && globalSummary.runs_evaluated > 0
-                  ? `${globalSummary.runs_evaluated.toLocaleString()} report${globalSummary.runs_evaluated !== 1 ? 's' : ''}`
-                  : 'no reports yet'}
-                {communityClearing ? ' — resetting…' : ''}
-              </span>
-            </p>
-            <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
-              <div className="bg-white border border-gray-200 rounded-xl shadow-sm px-4 py-3">
-                <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold">Pass Rate</p>
-                <p className="text-2xl font-bold text-gray-900 mt-1">{fmtPct(globalSummary?.pass_rate ?? null)}</p>
-              </div>
-              <div className="bg-white border border-gray-200 rounded-xl shadow-sm px-4 py-3">
-                <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold">Grounding Rate</p>
-                <p className="text-2xl font-bold text-gray-900 mt-1">{fmtPct(globalSummary?.grounding_rate ?? null)}</p>
-              </div>
-              <div className="bg-white border border-gray-200 rounded-xl shadow-sm px-4 py-3">
-                <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold">Faithfulness Rate</p>
-                <p className="text-2xl font-bold text-gray-900 mt-1">{fmtPct(globalSummary?.faithfulness_rate ?? null)}</p>
-              </div>
-              <div className="bg-white border border-gray-200 rounded-xl shadow-sm px-4 py-3">
-                <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold">Completeness</p>
-                <p className="text-2xl font-bold text-gray-900 mt-1">{fmtPct(globalSummary?.completeness_rate ?? null)}</p>
-              </div>
-              <div className="bg-white border border-gray-200 rounded-xl shadow-sm px-4 py-3">
-                <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold">Relevance</p>
-                <p className="text-2xl font-bold text-gray-900 mt-1">{fmtScore(globalSummary?.relevance_score ?? null)}</p>
-              </div>
-            </div>
-          </div>
-
-          {/* Trend chart — community-wide, so everyone sees the same picture */}
+          {/* Trend chart */}
           <div className="bg-white border border-gray-200 rounded-2xl shadow-sm p-4">
             <p className="text-sm font-semibold text-gray-900 mb-2">
               Quality Over Time

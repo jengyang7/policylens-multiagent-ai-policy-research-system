@@ -519,12 +519,11 @@ async def get_run(run_id: str) -> dict[str, object]:
 async def list_runs(
     request: Request, status: str | None = None, limit: int = 50
 ) -> list[dict[str, object]]:
-    """List research runs, most recently started first. Powers the eval dashboard's run picker."""
+    """List all research runs, most recently started first (public — no client scoping)."""
     assert _session_factory is not None
 
     stmt = (
         select(ResearchRun)
-        .where(ResearchRun.client_id == _client_id(request))
         .order_by(ResearchRun.started_at.desc())
         .limit(limit)
     )
@@ -587,7 +586,7 @@ async def run_eval(
     async with _session_factory() as session:
         result = await session.execute(select(ResearchRun).where(ResearchRun.id == run_id))
         run = result.scalar_one_or_none()
-        if not run or run.client_id != _client_id(request):
+        if not run:
             raise HTTPException(404, "Run not found")
 
     try:
@@ -704,12 +703,11 @@ async def community_eval_trend(limit: int = 200) -> list[dict[str, object]]:
 async def list_eval_reports(
     request: Request, run_id: str | None = None, limit: int = 100
 ) -> list[dict[str, object]]:
-    """List persisted eval report summaries (no full report body), most recent first."""
+    """List persisted eval report summaries (no full report body), most recent first (public)."""
     assert _session_factory is not None
 
     stmt = (
         select(EvalReportRecord)
-        .where(EvalReportRecord.client_id == _client_id(request))
         .order_by(EvalReportRecord.generated_at.desc())
         .limit(limit)
     )
@@ -725,7 +723,7 @@ async def list_eval_reports(
 
 @app.get("/eval/reports/{report_id}")
 async def get_eval_report(report_id: str, request: Request) -> dict[str, object]:
-    """Full persisted eval report, including grounding/faithfulness detail, for drill-down."""
+    """Full persisted eval report, including grounding/faithfulness detail, for drill-down (public)."""
     assert _session_factory is not None
 
     async with _session_factory() as session:
@@ -733,7 +731,7 @@ async def get_eval_report(report_id: str, request: Request) -> dict[str, object]
             select(EvalReportRecord).where(EvalReportRecord.id == report_id)
         )
         record = result.scalar_one_or_none()
-        if record is None or record.client_id != _client_id(request):
+        if record is None:
             raise HTTPException(404, "Eval report not found")
 
     return {**_eval_record_summary(record), "report": record.report}

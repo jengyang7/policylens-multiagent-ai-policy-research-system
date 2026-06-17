@@ -115,7 +115,16 @@ monkeypatch.setattr("engine.nodes.synthesize.ChatOpenAI", lambda **kw: mock_llm)
 
 ---
 
-### 11. Eval judges hardcoded `ChatOpenAI`, would crash for non-OpenAI eval models
+### 11. Render deploy hung 15 minutes and timed out after a migration was added
+**File:** `db/migrations/env.py`
+**Issue:** After pushing the title-feature migration (`7a885b67938e_add_title_to_research_runs.py`), the Render deploy built successfully but then `uv run alembic upgrade head && uv run uvicorn ...` produced zero log output for ~15 minutes before Render's port-scan timeout killed the deploy entirely (full outage — old instance also torn down by the rolling deploy).
+
+**Root cause:** Postgres `lock_timeout` defaults to 0 (wait forever). `ALTER TABLE research_runs ADD COLUMN title` requires an `ACCESS EXCLUSIVE` lock; if any session (e.g. the previous instance's connection pool) still holds an open transaction touching `research_runs`, the `ALTER TABLE` blocks indefinitely with no error and no log output (Python stdout is fully buffered off a TTY, hiding even the startup log lines).
+
+**Fix:** In `db/migrations/env.py`'s `run_migrations_online()`, added `connect_args={"connect_timeout": 10}` to `engine_from_config` and `connection.execute(text("SET lock_timeout = '10s'"))` before `context.configure`. Now a blocked migration fails after 10s with a clear `QueryCanceled` error instead of hanging until Render's 15-minute port-scan timeout takes down the whole deploy.
+
+**Result:** Not yet validated against a real blocked-lock deploy; should make the next occurrence fail fast and visibly instead of causing a full outage.
+### 12. Eval judges hardcoded `ChatOpenAI`, would crash for non-OpenAI eval models
 **Files:** `eval/faithfulness.py`, `eval/completeness.py`, `eval/relevance.py`
 **Issue:** All three LLM-as-judge checks instantiated `ChatOpenAI(model=lead_model, ...)` directly. The eval dashboard's "Run Eval" previously let the user pick any model from `/models` (including Claude/Gemini) as the judge — selecting a non-OpenAI model would fail at the `ChatOpenAI(...)` call.
 
@@ -123,7 +132,7 @@ monkeypatch.setattr("engine.nodes.synthesize.ChatOpenAI", lambda **kw: mock_llm)
 
 ---
 
-### 12. Judge's Verdict card rendered raw markdown as plain text with no paragraph breaks
+### 13. Judge's Verdict card rendered raw markdown as plain text with no paragraph breaks
 **File:** `web/app/page.tsx`
 **Issue:** The verdict card rendered `debateVerdict.reasoning` in a plain `<div>{...}</div>`, so literal `**bold**` markers showed unrendered and the judge's several `**Label:** point` sentences ran together as one unbroken paragraph (unlike `DebateBubble`, which uses `ReactMarkdown`).
 
@@ -131,7 +140,7 @@ monkeypatch.setattr("engine.nodes.synthesize.ChatOpenAI", lambda **kw: mock_llm)
 
 ---
 
-### 13. `## References` section inconsistent with the report's own `[i]` citations
+### 14. `## References` section inconsistent with the report's own `[i]` citations
 **File:** `engine/nodes/verify_citations.py`
 **Issue:** A real exported report (`will-agi-arrive-before-2030`) had `[60][63][65][66][67]` cited inline in the body with NO matching entry in `## References`, and a `[47]` entry in `## References` that was never cited anywhere in the body. The synthesizer free-hands its own References list alongside ~30 inline citations across a ~24K-character report, and can both omit entries it used and list entries it never used — `verify_citations` (which already rewrites the body to strip unfaithful citations) left the LLM's References list untouched, so these inconsistencies shipped straight to the reader.
 
@@ -141,7 +150,7 @@ monkeypatch.setattr("engine.nodes.synthesize.ChatOpenAI", lambda **kw: mock_llm)
 
 ---
 
-### 14. Stray `[Synthesis]` marker leaks from the debate transcript into the final report
+### 15. Stray `[Synthesis]` marker leaks from the debate transcript into the final report
 **Files:** `engine/nodes/debate.py`, `engine/nodes/synthesize.py`, `engine/nodes/verify_citations.py`
 **Issue:** The same exported report had `[Synthesis]` appearing twice in the **Final Report** body (e.g. "...the 'measurement crisis' where timelines oscillate based on narrow, noisy capability demonstrations [Synthesis]."). Debaters invent `[Synthesis]` as a pseudo-citation when referring to the research summary's own framing (not a specific numbered finding) — fine in the debate transcript, but the synthesizer copied it verbatim into the final report, where it has no `## References` entry and reads as a broken citation.
 
@@ -149,15 +158,15 @@ monkeypatch.setattr("engine.nodes.synthesize.ChatOpenAI", lambda **kw: mock_llm)
 
 ---
 
-### 15. `tests/test_eval_harness.py` mocked a `ChatOpenAI` attribute removed by Issue #11's fix
+### 16. `tests/test_eval_harness.py` mocked a `ChatOpenAI` attribute removed by Issue #12's fix
 **File:** `tests/test_eval_harness.py`
-**Issue:** Issue #11 routed `eval/faithfulness.py`, `eval/completeness.py`, and `eval/relevance.py` through `make_chat_model()` instead of `ChatOpenAI(...)` directly, but `_mock_structured_chain()` in the test file still did `monkeypatch.setattr(f"{module}.ChatOpenAI", ...)` — `AttributeError: module has no attribute 'ChatOpenAI'`, failing all 5 LLM-judge tests (`uv run pytest` → 5 failed).
+**Issue:** Issue #12 routed `eval/faithfulness.py`, `eval/completeness.py`, and `eval/relevance.py` through `make_chat_model()` instead of `ChatOpenAI(...)` directly, but `_mock_structured_chain()` in the test file still did `monkeypatch.setattr(f"{module}.ChatOpenAI", ...)` — `AttributeError: module has no attribute 'ChatOpenAI'`, failing all 5 LLM-judge tests (`uv run pytest` → 5 failed).
 
 **Fix:** Updated `_mock_structured_chain()` to patch `{module}.make_chat_model` instead. `structured_output_kwargs(lead_model)` needed no mocking — it's a pure function. `uv run pytest` → 61 passed.
 
 ---
 
-### 16. Step cards stayed open through synthesis; no progress visible outside the page
+### 17. Step cards stayed open through synthesis; no progress visible outside the page
 **File:** `web/app/page.tsx`
 **Issue:** Two related UX gaps: (1) the Research Plan / Debate / Verdict / Gap Research cards only auto-collapsed on specific later events (`debating`, `gap_plan`, `report`), so e.g. in a no-gap debate run the debate + verdict cards stayed expanded throughout the entire synthesis step; (2) there was no way to see run progress without the tab in focus — the browser tab title stayed static the whole run.
 
@@ -165,7 +174,7 @@ monkeypatch.setattr("engine.nodes.synthesize.ChatOpenAI", lambda **kw: mock_llm)
 
 ---
 
-### 17. `## References` section came back completely empty when the synthesizer used a numbered-list format
+### 18. `## References` section came back completely empty when the synthesizer used a numbered-list format
 **Files:** `eval/report_parsing.py`, `engine/nodes/verify_citations.py`, `tests/test_phase2_smoke.py`
 **Issue:** The synthesize prompt asks for References lines formatted exactly as `[1] [Title](url)`, but the model sometimes "prettifies" this into a standard numbered markdown list (`1. [Title](url)`) instead. `_REF_LINE_RE` only matched the literal `[1] [...]` bracket form, so `parse_references()` returned an empty `citation_map` for these reports. In `run_faithfulness_checks`, every `[i]`-cited sentence then failed to resolve its citation index ("citation [i] not found in the References section") and was judged automatically unfaithful — `verify_citations` stripped every `[i]` marker from the body in response, leaving `cited` empty in `_rebuild_references()`, which returned a bare `"\n\n## References\n"` heading with no entries. Net effect: a real report with `[1][2]`-style inline citations in the body shipped with a completely empty References section (and the inline markers themselves stripped too).
 
@@ -173,7 +182,7 @@ monkeypatch.setattr("engine.nodes.synthesize.ChatOpenAI", lambda **kw: mock_llm)
 
 ---
 
-### 18. Debate-mode UI polish batch (thinking bubbles, status line, card badges, verdict auto-collapse, log labels)
+### 19. Debate-mode UI polish batch (thinking bubbles, status line, card badges, verdict auto-collapse, log labels)
 **File:** `web/app/page.tsx`
 **Issue:** A batch of small debate-mode UX issues from user testing: (1) the "opposite agent is thinking" bubble showed even while the *current* agent was still streaming its turn, which read as if both agents were active at once; (2) the browser tab status line only showed coarse milestones (e.g. "Research"), not each individual step as it happened; (3) card titles for the Research Plan, Debate panel, and Judge's Verdict redundantly showed a spinner + "Thinking…" badge next to the title even though the card body already showed live progress; (4) the Judge's Verdict card stayed expanded once the debate-driven gap research round started searching, competing for attention with the new gap subagent cards; (5) "Thinking Steps" log entries for research subtasks were labeled "Research Execution" / "Follow-up Research Execution".
 
@@ -181,7 +190,7 @@ monkeypatch.setattr("engine.nodes.synthesize.ChatOpenAI", lambda **kw: mock_llm)
 
 ---
 
-### 19. `'NoneType' object has no attribute 'gap_questions'` crashed the run during "Identifying evidence gaps from the debate…"
+### 20. `'NoneType' object has no attribute 'gap_questions'` crashed the run during "Identifying evidence gaps from the debate…"
 **File:** `engine/nodes/debate.py`
 **Issue:** `plan_gap_research` and `judge_debate` both call `llm.with_structured_output(Schema, include_raw=True)` and then unconditionally do `result = raw["parsed"]` followed by `result.<field>`. When the model occasionally replies without invoking the structured-output tool (no schema match), `raw["parsed"]` is `None`, so `result.gap_questions` raised `AttributeError: 'NoneType' object has no attribute 'gap_questions'` — caught by `_stream_graph`'s catch-all, which failed the whole run.
 
@@ -189,17 +198,17 @@ monkeypatch.setattr("engine.nodes.synthesize.ChatOpenAI", lambda **kw: mock_llm)
 
 ---
 
-### 20. References section still came back empty (and inline `[i]` markers all stripped) when the synthesizer wrote citations but no `## References` section at all
+### 21. References section still came back empty (and inline `[i]` markers all stripped) when the synthesizer wrote citations but no `## References` section at all
 **File:** `eval/faithfulness.py`
-**Issue:** Issue #17 fixed `_REF_LINE_RE` to also accept numbered-list reference formatting, but a real exported report (`will-ai-create-more-jobs-than-it-destroys-2026-06-15.md`, debate mode + gap research, 16 sources) still came back with a totally empty `## References` section — and this time **every** `[1]`/`[2]` inline citation was gone from the body too, not just the reference list. Root cause: the synthesizer's report had no `## References` section in *any* recognizable format, so `parse_references(report)` returned an empty `citation_map`. In `run_faithfulness_checks`, every cited sentence then had `citation_map.get(index) is None` for all its indices → zero `candidate_findings` → automatic `faithful=False` ("citation [i] not found in the References section") for literally every cited sentence in the report. `verify_citations` stripped every `[i]` marker in response, so `_rebuild_references` saw `cited = {}` and returned a bare `"\n\n## References\n"`.
+**Issue:** Issue #18 fixed `_REF_LINE_RE` to also accept numbered-list reference formatting, but a real exported report (`will-ai-create-more-jobs-than-it-destroys-2026-06-15.md`, debate mode + gap research, 16 sources) still came back with a totally empty `## References` section — and this time **every** `[1]`/`[2]` inline citation was gone from the body too, not just the reference list. Root cause: the synthesizer's report had no `## References` section in *any* recognizable format, so `parse_references(report)` returned an empty `citation_map`. In `run_faithfulness_checks`, every cited sentence then had `citation_map.get(index) is None` for all its indices → zero `candidate_findings` → automatic `faithful=False` ("citation [i] not found in the References section") for literally every cited sentence in the report. `verify_citations` stripped every `[i]` marker in response, so `_rebuild_references` saw `cited = {}` and returned a bare `"\n\n## References\n"`.
 
 **Fix:** `run_faithfulness_checks` now mirrors `_rebuild_references`'s existing fallback: when `citation_map.get(index)` is `None` but `1 <= index <= len(findings)`, it uses `findings[index - 1]` directly as the candidate finding (the same 1-indexed mapping `_rebuild_references` already relies on for indices the synthesizer's list omitted) instead of auto-failing. The judge now gets a real finding to check the sentence against, so a missing/malformed References section no longer wholesale-strips every citation in the report. `uv run pytest` → 61 passed.
 
 ---
 
-### 21. References still empty — synthesizer produced zero `[i]` inline citations (root cause)
+### 22. References still empty — synthesizer produced zero `[i]` inline citations (root cause)
 **File:** `engine/nodes/synthesize.py`
-**Issue:** Issues #17–#20 treated `verify_citations` as the culprit (stripping citations that existed), but DB inspection confirmed the stored reports had ZERO `[i]` markers in the body and NO `## References` section whatsoever — meaning the **synthesizer itself never wrote any inline citations**. Root cause: `compact_findings` produces a prose narrative with source URLs embedded in text but NO pre-numbered `[1]`, `[2]`... anchors. When the synthesizer receives this prose as `findings_text`, it has no explicit `[i]` → URL mapping to work from, so it produces well-structured prose without any citation markers (especially with smaller/faster models like Claude Haiku 4.5 on long contexts with 100+ findings).
+**Issue:** Issues #18–#21 treated `verify_citations` as the culprit (stripping citations that existed), but DB inspection confirmed the stored reports had ZERO `[i]` markers in the body and NO `## References` section whatsoever — meaning the **synthesizer itself never wrote any inline citations**. Root cause: `compact_findings` produces a prose narrative with source URLs embedded in text but NO pre-numbered `[1]`, `[2]`... anchors. When the synthesizer receives this prose as `findings_text`, it has no explicit `[i]` → URL mapping to work from, so it produces well-structured prose without any citation markers (especially with smaller/faster models like Claude Haiku 4.5 on long contexts with 100+ findings).
 
 **Fix:** Added `_source_list(findings)`, which builds a deduplicated, numbered list of source URLs (first-occurrence order) and appends it to the compact summary in `findings_text`. The synthesizer now receives:
 
@@ -216,7 +225,7 @@ This gives an explicit `[i]` → URL anchor in the exact format the synthesizer 
 
 ---
 
-### 22. References section rendered as a single run-on paragraph instead of a vertical list
+### 23. References section rendered as a single run-on paragraph instead of a vertical list
 **Files:** `engine/nodes/verify_citations.py`
 **Issue:** `_rebuild_references()` joined entries with `"\n".join(entries)`, producing a single `\n`-separated block. ReactMarkdown treats inline newlines within a block as a soft break (renders as a space), so all reference entries appeared on one line in the browser — e.g. `[1] [Title1](url1) [2] [Title2](url2) ...` instead of a stacked list.
 
@@ -224,7 +233,7 @@ This gives an explicit `[i]` → URL anchor in the exact format the synthesizer 
 
 ---
 
-### 23. Follow-up Chat section had no quick-start prompts when chat history was empty
+### 24. Follow-up Chat section had no quick-start prompts when chat history was empty
 **File:** `web/app/page.tsx`
 **Issue:** Users landed on a blank chat input with no cues about what to ask — first-time users especially didn't know where to start.
 
@@ -232,7 +241,7 @@ This gives an explicit `[i]` → URL anchor in the exact format the synthesizer 
 
 ---
 
-### 24. Final report body had no visual hierarchy for key data points
+### 25. Final report body had no visual hierarchy for key data points
 **File:** `engine/nodes/synthesize.py`
 **Issue:** The synthesizer wrote well-structured prose but never used bold, so key statistics and critical conclusions were buried in paragraph text and hard to scan.
 

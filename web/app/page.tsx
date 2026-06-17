@@ -413,18 +413,20 @@ function TrashIcon() {
 }
 
 function Sidebar({
-  history, activeId, locked, mobileOpen, view, onNewResearch, onShowEvalDashboard, onShowLibrary, onSelect, onDelete, onClose,
+  history, activeId, locked, mobileOpen, view, publicRuns, onNewResearch, onShowEvalDashboard, onShowLibrary, onSelect, onDelete, onPublicSelect, onClose,
 }: {
-  history: HistoryEntry[];
+  history: HistoryEntry[];        // localStorage entries for cache lookup + delete + live dot
   activeId: string | null;
   locked: boolean;
   mobileOpen: boolean;
   view: 'research' | 'eval' | 'library';
+  publicRuns: {id: string; title: string; query: string}[];
   onNewResearch: () => void;
   onShowEvalDashboard: () => void;
   onShowLibrary: () => void;
   onSelect: (entry: HistoryEntry) => void;
   onDelete: (id: string, e: React.MouseEvent) => void;
+  onPublicSelect: (runId: string) => void;
   onClose: () => void;
 }) {
   const evalActive = view === 'eval';
@@ -515,41 +517,44 @@ function Sidebar({
         </button>
       </div>
 
-      {/* Recents */}
+      {/* History — unified public feed; local entries load from cache, others fetch from API */}
       <div className="flex-1 min-h-0 flex flex-col px-3 pt-5 pb-3">
         <p className="px-3 text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-1.5">
-          Recents
+          History
         </p>
         <div className="flex-1 overflow-y-auto space-y-0.5 text-[13px]">
-          {history.length === 0 ? (
+          {publicRuns.length === 0 ? (
             <p className="px-3 py-2 text-xs text-gray-400">No research yet</p>
-          ) : history.map(entry => {
-            const isActive = view === 'research' && entry.id === activeId;
-            const isLive = isActive && (entry.phase === 'researching' || entry.phase === 'querying' || entry.phase === 'clarifying');
+          ) : publicRuns.map(run => {
+            const localEntry = history.find(h => h.runId === run.id);
+            const isActive = view === 'research' && run.id === activeId;
+            const isLive = !!localEntry && isActive && (localEntry.phase === 'researching' || localEntry.phase === 'querying' || localEntry.phase === 'clarifying');
+            const isDisabled = locked && !isActive;
             return (
               <div
-                key={entry.id}
+                key={run.id}
                 role="button"
                 tabIndex={0}
-                aria-disabled={locked && !isActive}
-                onClick={() => onSelect(entry)}
-                onKeyDown={e => { if (e.key === 'Enter') onSelect(entry); }}
+                aria-disabled={isDisabled}
+                onClick={() => { if (isDisabled) return; localEntry ? onSelect(localEntry) : onPublicSelect(run.id); }}
+                onKeyDown={e => { if (e.key === 'Enter' && !isDisabled) { localEntry ? onSelect(localEntry) : onPublicSelect(run.id); } }}
                 className={`group w-full flex items-center gap-2 px-3 py-2 rounded-xl transition-colors ${
                   isActive
                     ? 'bg-white border border-gray-200 text-gray-900 font-semibold shadow-sm'
                     : 'text-gray-500 hover:bg-gray-100 hover:text-gray-800'
-                } ${locked && !isActive ? 'opacity-50' : ''}`}
+                } ${isDisabled ? 'opacity-50 cursor-default' : 'cursor-pointer'}`}
               >
-                {/* <HistoryItemIcon /> */}
-                <span className="flex-1 truncate">{entry.title || entry.query || 'Untitled research'}</span>
+                <span className="flex-1 truncate">{run.title || run.query || 'Untitled'}</span>
                 {isLive && <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse flex-shrink-0" />}
-                <button
-                  onClick={e => onDelete(entry.id, e)}
-                  className="flex-shrink-0 opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 transition-opacity p-0.5"
-                  aria-label="Delete research"
-                >
-                  <TrashIcon />
-                </button>
+                {localEntry && (
+                  <button
+                    onClick={e => onDelete(localEntry.id, e)}
+                    className="flex-shrink-0 opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 transition-opacity p-0.5"
+                    aria-label="Delete research"
+                  >
+                    <TrashIcon />
+                  </button>
+                )}
               </div>
             );
           })}
@@ -597,6 +602,7 @@ export default function Home() {
 
   const [history,  setHistory]  = useState<HistoryEntry[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [publicRuns, setPublicRuns] = useState<{id: string; title: string; query: string}[]>([]);
 
   const [libraryChatMessages,  setLibraryChatMessages]  = useState<LibraryChatMessage[]>([]);
   const [libraryChatInput,     setLibraryChatInput]     = useState('');
@@ -665,6 +671,7 @@ export default function Home() {
   // stageProgress above) — lets subtask_done look up "Subagent N" by question.
   const subtasksRef = useRef<SubtaskState[]>([]);
   const gapSubtasksRef = useRef<SubtaskState[]>([]);
+  const streamingRunIdRef = useRef<string>('');
 
   // Anonymous per-visitor id (no login) — scopes /runs and /eval/reports so
   // visitors only see their own data. Generated once and persisted locally.
@@ -777,6 +784,14 @@ export default function Home() {
         if (data.defaults?.skeptic) setSkepticModel(data.defaults.skeptic);
       })
       .catch(() => { /* keep the hardcoded fallback */ });
+  }, []);
+
+  // Fetch global public run history on mount for the sidebar
+  useEffect(() => {
+    fetch(`${API}/runs?status=done&limit=30`)
+      .then(res => res.json())
+      .then((runs: {id: string; title: string; query: string}[]) => setPublicRuns(runs))
+      .catch(() => { /* non-critical */ });
   }, []);
 
   // Read or generate the anonymous client id on mount
@@ -916,7 +931,10 @@ export default function Home() {
     // Convert server unix timestamp (seconds) to ms for consistent timing
     const serverTs = data.ts ? (data.ts as number) * 1000 : undefined;
     if (type === 'started') {
-      setRunId(data.run_id as string);
+      const rid = data.run_id as string;
+      streamingRunIdRef.current = rid;
+      setRunId(rid);
+      setPublicRuns(prev => [{ id: rid, title: query, query }, ...prev.filter(r => r.id !== rid)]);
       addLog('start', 'Initialization', undefined, serverTs);
     } else if (type === 'plan_thinking') {
       setPhase('researching');
@@ -930,7 +948,10 @@ export default function Home() {
       subtasksRef.current = newSubtasks;
       stageProgress.current.plan = { total: qs.length, done: 0 };
       const planTitle = data.title as string | undefined;
-      if (planTitle) setTitle(planTitle);
+      if (planTitle) {
+        setTitle(planTitle);
+        setPublicRuns(prev => prev.map(r => r.id === streamingRunIdRef.current ? { ...r, title: planTitle } : r));
+      }
     } else if (type === 'subtask_done') {
       const q     = data.question as string;
       const count = (data.findings_count as number) ?? 0;
@@ -1254,6 +1275,35 @@ export default function Home() {
     }
   }
 
+  async function loadPublicRun(runId: string) {
+    if (phase === 'researching' || phase === 'querying' || phase === 'clarifying') return;
+    const res = await fetch(`${API}/runs/${runId}`).catch(() => null);
+    if (!res?.ok) return;
+    const data = await res.json();
+    const entry: HistoryEntry = {
+      id: runId,
+      runId,
+      query: data.query ?? '',
+      title: data.title ?? data.query ?? '',
+      createdAt: data.started_at ? Date.parse(data.started_at) : Date.now(),
+      phase: 'done',
+      subtasks: (data.plan?.subtasks ?? []).map((q: string) => ({ question: q, status: 'done' as const, findingsCount: 0 })),
+      sources: [],
+      log: [],
+      report: data.report ?? '',
+      showReport: true,
+      chatMessages: [],
+      usageStats: null,
+      debateTurns: data.debate_turns ?? [],
+      debateRun: (data.debate_turns ?? []).length > 0,
+      debateVerdict: data.debate_verdict ?? null,
+    };
+    restoreEntry(entry);
+    setActiveId(runId);
+    setView('research');
+    setSidebarOpen(false);
+  }
+
   function copyReport() {
     if (!report) return;
     navigator.clipboard.writeText(report).then(() => {
@@ -1373,11 +1423,13 @@ export default function Home() {
         locked={phase === 'researching' || phase === 'querying' || phase === 'clarifying'}
         mobileOpen={sidebarOpen}
         view={view}
+        publicRuns={publicRuns}
         onNewResearch={() => { reset(); setSidebarOpen(false); }}
         onShowEvalDashboard={() => { setView('eval'); setSidebarOpen(false); }}
         onShowLibrary={() => { setView('library'); setSidebarOpen(false); }}
         onSelect={entry => { selectEntry(entry); setSidebarOpen(false); }}
         onDelete={deleteEntry}
+        onPublicSelect={loadPublicRun}
         onClose={() => setSidebarOpen(false)}
       />
 
