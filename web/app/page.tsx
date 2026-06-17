@@ -2333,7 +2333,7 @@ export default function Home() {
                         className="flex-1 border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none disabled:bg-gray-50"
                       />
                       <button
-                        onClick={sendChat}
+                        onClick={() => sendChat()}
                         disabled={!chatInput.trim() || chatStreaming}
                         className="bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white rounded-xl px-4 py-2.5 text-sm font-semibold transition-colors"
                       >
