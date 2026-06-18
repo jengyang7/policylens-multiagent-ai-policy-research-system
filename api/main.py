@@ -568,6 +568,7 @@ async def delete_run(run_id: str, request: Request) -> dict[str, object]:
         await session.commit()
 
     await _checkpointer.adelete_thread(run_id)
+    await rag.delete_chunks(run_id)
 
     return {"deleted": run_id}
 
@@ -804,13 +805,30 @@ async def chat(body: ChatRequest) -> EventSourceResponse:
 
 @app.post("/library/chat")
 async def library_chat(body: LibraryChatRequest) -> EventSourceResponse:
-    """RAG chatbot over all completed research reports (Layer 4: long-term memory)."""
+    """RAG chatbot over all completed research reports (Layer 4: long-term memory).
+
+    Two-stage retrieval:
+      Stage 1 — LLM scans report titles/queries, selects topically relevant run_ids.
+      Stage 2 — semantic search scoped to those run_ids with a similarity cutoff.
+    """
     assert _session_factory is not None
 
     async def stream() -> AsyncGenerator[dict[str, str], None]:
         try:
+            # Fetch all completed runs so Stage 1 can filter by metadata
+            async with _session_factory() as session:
+                rows = await session.execute(
+                    select(ResearchRun.id, ResearchRun.title, ResearchRun.query)
+                    .where(ResearchRun.status == "completed")
+                    .order_by(ResearchRun.started_at.desc())
+                )
+                available_reports = [
+                    {"run_id": str(r.id), "title": r.title or r.query, "query": r.query}
+                    for r in rows
+                ]
+
             yield _evt({"type": "searching"})
-            chunks = await rag.search(body.question)
+            selected_ids, chunks = await rag.two_stage_search(body.question, available_reports)
 
             # Emit retrieved chunks so the UI can show them in the sidebar
             yield _evt({

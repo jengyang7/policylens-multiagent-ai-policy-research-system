@@ -1852,7 +1852,17 @@ export default function Home() {
                         <p className="text-xs text-gray-400 mt-0.5">Tap an option or type a custom answer</p>
                       </div>
                       <button
-                        onClick={() => { setPhase('idle'); setClarifyQuestions([]); setClarifyOptions([]); setClarifyAnswers([]); }}
+                        onClick={() => {
+                          // Remove the incomplete history entry so re-submitting doesn't create a duplicate
+                          if (activeId) {
+                            const entry = history.find(h => h.id === activeId);
+                            if (entry?.runId) setPublicRuns(prev => prev.filter(r => r.id !== entry.runId));
+                            setHistory(prev => prev.filter(h => h.id !== activeId));
+                            setActiveId(null);
+                          }
+                          setPhase('idle');
+                          setClarifyQuestions([]); setClarifyOptions([]); setClarifyAnswers([]);
+                        }}
                         className="ml-4 mt-0.5 flex-shrink-0 w-7 h-7 flex items-center justify-center rounded-full text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors"
                         aria-label="Cancel"
                       >
