@@ -68,6 +68,86 @@ class RelevanceResult(BaseModel):
     reasoning: str
 
 
+class RagChunkVerdict(BaseModel):
+    """LLM-judge verdict for one retrieved chunk's relevance to the question."""
+
+    chunk_index: int
+    title: str
+    section: str  # header_path from MarkdownNodeParser (e.g. /Topic/Subtopic/)
+    preview: str  # first 200 chars of chunk content
+    relevant: bool
+    reasoning: str
+
+
+class RagAnswerClaimVerdict(BaseModel):
+    """LLM-judge verdict for one atomic claim extracted from the RAG answer."""
+
+    claim: str
+    supported: bool
+    reasoning: str
+
+
+class RagEvalReport(BaseModel):
+    """Aggregate RAG eval result for one question against the Research Library."""
+
+    question: str
+    generated_at: str
+
+    # Stage 1 — metadata filter
+    selected_reports: list[str]  # run_ids the LLM selected as relevant
+
+    # Stage 2 — retrieval
+    chunks_retrieved: int
+    chunk_verdicts: list[RagChunkVerdict]
+    context_precision: float  # relevant chunks / total chunks (0–1)
+
+    # Generation
+    answer: str
+    claim_verdicts: list[RagAnswerClaimVerdict]
+    answer_faithfulness: float  # supported claims / total claims (0–1)
+
+    eval_model: str = ""
+    eval_input_tokens: int = 0
+    eval_output_tokens: int = 0
+    eval_cost_usd: float = 0.0
+
+    def summary(self) -> str:
+        """Human-readable multi-line summary for CLI output."""
+        n_relevant = sum(1 for v in self.chunk_verdicts if v.relevant)
+        n_supported = sum(1 for v in self.claim_verdicts if v.supported)
+        lines = [
+            f"RAG Eval: {self.question}",
+            f"Generated: {self.generated_at}",
+            "",
+            f"Stage 1 selected {len(self.selected_reports)} report(s)",
+            f"Stage 2 retrieved {self.chunks_retrieved} chunk(s)",
+            "",
+            f"Context Precision: {self.context_precision:.0%} "
+            f"({n_relevant}/{len(self.chunk_verdicts)} chunks relevant)",
+        ]
+        for v in self.chunk_verdicts:
+            mark = "+" if v.relevant else "-"
+            lines.append(f"  [{mark}] [{v.title}] {v.preview[:80]}…")
+            if not v.relevant:
+                lines.append(f"       {v.reasoning}")
+        lines += [
+            "",
+            f"Answer Faithfulness: {self.answer_faithfulness:.0%} "
+            f"({n_supported}/{len(self.claim_verdicts)} claims supported)",
+        ]
+        for v in self.claim_verdicts:
+            mark = "+" if v.supported else "-"
+            lines.append(f"  [{mark}] {v.claim}")
+            if not v.supported:
+                lines.append(f"       {v.reasoning}")
+        lines += [
+            "",
+            f"Eval cost: ${self.eval_cost_usd:.4f} ({self.eval_model}, "
+            f"{self.eval_input_tokens + self.eval_output_tokens} tokens)",
+        ]
+        return "\n".join(lines)
+
+
 class EvalReport(BaseModel):
     """Aggregate eval result for one completed research run."""
 

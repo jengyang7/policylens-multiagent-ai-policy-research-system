@@ -6,6 +6,37 @@ import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 // Types (mirror api/main.py response shapes + eval/schema.py)
 // ---------------------------------------------------------------------------
 
+interface RagChunkVerdict {
+  chunk_index: number;
+  title: string;
+  section: string;
+  preview: string;
+  relevant: boolean;
+  reasoning: string;
+}
+
+interface RagAnswerClaimVerdict {
+  claim: string;
+  supported: boolean;
+  reasoning: string;
+}
+
+interface RagEvalReport {
+  question: string;
+  generated_at: string;
+  selected_reports: string[];
+  chunks_retrieved: number;
+  chunk_verdicts: RagChunkVerdict[];
+  context_precision: number;
+  answer: string;
+  claim_verdicts: RagAnswerClaimVerdict[];
+  answer_faithfulness: number;
+  eval_model: string;
+  eval_cost_usd: number;
+  eval_input_tokens: number;
+  eval_output_tokens: number;
+}
+
 interface RunStats {
   lead_model?: string;
   subagent_model?: string;
@@ -462,6 +493,123 @@ function DetailPanel({ detail, loading }: { detail: EvalReportDetail | null; loa
 }
 
 // ---------------------------------------------------------------------------
+// RAG Eval result panel
+// ---------------------------------------------------------------------------
+
+function ScoreBar({ value, color }: { value: number; color: string }) {
+  return (
+    <div className="w-full bg-gray-100 rounded-full h-1.5 mt-1.5">
+      <div className={`h-1.5 rounded-full ${color}`} style={{ width: `${Math.round(value * 100)}%` }} />
+    </div>
+  );
+}
+
+function RagEvalResultPanel({ result }: { result: RagEvalReport }) {
+  const [showAnswer, setShowAnswer] = useState(false);
+  const precisionColor = result.context_precision >= 0.8 ? 'bg-emerald-500' : result.context_precision >= 0.5 ? 'bg-amber-400' : 'bg-red-400';
+  const faithColor = result.answer_faithfulness >= 0.8 ? 'bg-emerald-500' : result.answer_faithfulness >= 0.5 ? 'bg-amber-400' : 'bg-red-400';
+
+  return (
+    <div className="space-y-4 pt-2 border-t border-gray-100">
+      {/* Score cards */}
+      <div className="grid grid-cols-2 gap-3">
+        <div className="bg-gray-50 border border-gray-200 rounded-xl px-4 py-3">
+          <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold">Context Precision</p>
+          <p className="text-2xl font-bold text-gray-900 mt-1">{fmtPct(result.context_precision * 100)}</p>
+          <ScoreBar value={result.context_precision} color={precisionColor} />
+          <p className="text-[10px] text-gray-400 mt-1.5">
+            {result.chunk_verdicts.filter(v => v.relevant).length}/{result.chunk_verdicts.length} chunks relevant
+          </p>
+        </div>
+        <div className="bg-gray-50 border border-gray-200 rounded-xl px-4 py-3">
+          <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold">Answer Faithfulness</p>
+          <p className="text-2xl font-bold text-gray-900 mt-1">{fmtPct(result.answer_faithfulness * 100)}</p>
+          <ScoreBar value={result.answer_faithfulness} color={faithColor} />
+          <p className="text-[10px] text-gray-400 mt-1.5">
+            {result.claim_verdicts.filter(v => v.supported).length}/{result.claim_verdicts.length} claims supported
+          </p>
+        </div>
+      </div>
+
+      {/* Meta row */}
+      <div className="flex items-center gap-3 text-[11px] text-gray-400 flex-wrap">
+        <span>{result.selected_reports.length} report(s) selected · {result.chunks_retrieved} chunk(s) retrieved</span>
+        <span>·</span>
+        <span>{fmtCost(result.eval_cost_usd)} eval cost</span>
+        <span>·</span>
+        <span>{result.eval_model}</span>
+      </div>
+
+      {/* Chunk verdicts */}
+      {result.chunk_verdicts.length > 0 && (
+        <div>
+          <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-1.5">
+            Retrieved Chunks
+          </p>
+          <div className="space-y-1.5">
+            {result.chunk_verdicts.map((v, i) => (
+              <div key={i} className="flex items-start gap-2 bg-white border border-gray-200 rounded-lg px-3 py-2">
+                {v.relevant ? <CheckIcon /> : <CrossIcon />}
+                <div className="min-w-0 flex-1">
+                  <p className="text-xs font-medium text-gray-700">
+                    {v.title}{v.section && v.section !== '/' ? <span className="text-gray-400 font-normal"> · {v.section}</span> : null}
+                  </p>
+                  <p className="text-[11px] text-gray-500 mt-0.5 line-clamp-2">{v.preview}</p>
+                  {!v.relevant && <p className="text-[10px] text-red-500 mt-0.5">{v.reasoning}</p>}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Claim verdicts */}
+      {result.claim_verdicts.length > 0 && (
+        <div>
+          <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-1.5">
+            Answer Claims
+          </p>
+          <div className="space-y-1.5">
+            {result.claim_verdicts.map((v, i) => (
+              <div key={i} className="flex items-start gap-2 bg-white border border-gray-200 rounded-lg px-3 py-2">
+                {v.supported ? <CheckIcon /> : <CrossIcon />}
+                <div className="min-w-0 flex-1">
+                  <p className="text-xs text-gray-700">{v.claim}</p>
+                  {!v.supported && <p className="text-[10px] text-red-500 mt-0.5">{v.reasoning}</p>}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Generated answer (collapsible) */}
+      {result.answer && (
+        <div>
+          <button
+            onClick={() => setShowAnswer(a => !a)}
+            className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold hover:text-gray-600 transition-colors"
+          >
+            {showAnswer ? '▾' : '▸'} Generated Answer
+          </button>
+          {showAnswer && (
+            <div className="mt-1.5 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2">
+              <p className="text-xs text-gray-700 whitespace-pre-wrap">{result.answer}</p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {result.chunks_retrieved === 0 && (
+        <p className="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+          No chunks were retrieved. Try re-indexing the library or asking a question covered by your research reports.
+        </p>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Main dashboard
 // ---------------------------------------------------------------------------
 
@@ -476,6 +624,15 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
   const [detail, setDetail] = useState<EvalReportDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
+
+  // RAG eval state
+  const [ragQuestion, setRagQuestion] = useState('');
+  const [ragEvalLoading, setRagEvalLoading] = useState(false);
+  const [ragEvalResult, setRagEvalResult] = useState<RagEvalReport | null>(null);
+
+  // Re-index state
+  const [reindexing, setReindexing] = useState(false);
+  const [reindexResult, setReindexResult] = useState<{ indexed: number; total: number; failed: {run_id: string; reason: string}[] } | null>(null);
 
   // Custom confirmation modal (replaces window.confirm for destructive actions)
   const [confirmDialog, setConfirmDialog] = useState<{
@@ -618,6 +775,44 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
       confirmLabel: 'Delete',
       onConfirm: () => deleteRun(runId),
     });
+  }
+
+  async function runRagEval() {
+    if (!ragQuestion.trim()) return;
+    setRagEvalLoading(true);
+    setRagEvalResult(null);
+    setErrorMsg('');
+    try {
+      const res = await fetch(`${apiBase}/library/eval`, {
+        method: 'POST',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question: ragQuestion, eval_model: evalModel }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        throw new Error(body?.detail ?? `HTTP ${res.status}`);
+      }
+      setRagEvalResult(await res.json());
+    } catch (e) {
+      setErrorMsg(String(e));
+    } finally {
+      setRagEvalLoading(false);
+    }
+  }
+
+  async function reindexLibrary() {
+    setReindexing(true);
+    setReindexResult(null);
+    setErrorMsg('');
+    try {
+      const res = await fetch(`${apiBase}/library/reindex`, { method: 'POST', headers });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setReindexResult(await res.json());
+    } catch (e) {
+      setErrorMsg(String(e));
+    } finally {
+      setReindexing(false);
+    }
   }
 
   return (
@@ -773,6 +968,54 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
           <div className="bg-white border border-gray-200 rounded-2xl shadow-sm p-4">
             <p className="text-sm font-semibold text-gray-900 mb-3">Report Detail</p>
             <DetailPanel detail={detail} loading={detailLoading} />
+          </div>
+
+          {/* RAG Eval */}
+          <div className="bg-white border border-gray-200 rounded-2xl shadow-sm p-4 space-y-4">
+            <div className="flex items-start justify-between gap-3 flex-wrap">
+              <div>
+                <p className="text-sm font-semibold text-gray-900">Research Library RAG Eval</p>
+                <p className="text-xs text-gray-400 mt-0.5">
+                  Evaluates retrieval precision and answer faithfulness for any question.
+                </p>
+              </div>
+              <div className="flex flex-col items-end gap-1">
+                <button
+                  onClick={reindexLibrary}
+                  disabled={reindexing}
+                  className="inline-flex items-center gap-1.5 text-xs font-semibold text-gray-600 hover:text-gray-900 border border-gray-200 hover:border-gray-300 px-3 py-1.5 rounded-lg disabled:opacity-50 transition-colors"
+                >
+                  {reindexing && <Spinner />}
+                  {reindexing ? 'Re-indexing…' : 'Re-index Library'}
+                </button>
+                {reindexResult && (
+                  <p className="text-[11px] text-gray-500">
+                    Indexed {reindexResult.indexed}/{reindexResult.total} runs
+                    {reindexResult.failed.length > 0 && ` · ${reindexResult.failed.length} failed`}
+                  </p>
+                )}
+              </div>
+            </div>
+
+            <div className="flex gap-2">
+              <input
+                value={ragQuestion}
+                onChange={e => setRagQuestion(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && !ragEvalLoading && runRagEval()}
+                placeholder="Ask a question to evaluate retrieval quality…"
+                className="flex-1 text-sm border border-gray-200 rounded-lg px-3 py-2 outline-none focus:ring-2 focus:ring-blue-100 focus:border-blue-400 transition"
+              />
+              <button
+                onClick={runRagEval}
+                disabled={ragEvalLoading || !ragQuestion.trim()}
+                className="inline-flex items-center gap-1.5 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg disabled:opacity-50 transition-colors whitespace-nowrap"
+              >
+                {ragEvalLoading && <Spinner />}
+                {ragEvalLoading ? 'Evaluating…' : 'Run RAG Eval'}
+              </button>
+            </div>
+
+            {ragEvalResult && <RagEvalResultPanel result={ragEvalResult} />}
           </div>
         </>
       )}

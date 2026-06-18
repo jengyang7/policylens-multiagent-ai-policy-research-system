@@ -37,6 +37,7 @@ from engine.nodes.chat import answer_followup
 from engine.orchestrator import DEFAULT_DEBATE_ROUNDS, build_graph
 from engine.state import TokenUsage
 from eval.harness import evaluate_run
+from eval.rag_eval import evaluate_rag
 
 load_dotenv()
 
@@ -132,6 +133,18 @@ class ChatRequest(BaseModel):
 class LibraryChatRequest(BaseModel):
     question: str
     history: list[dict[str, str]] = []
+
+
+class RagEvalRequest(BaseModel):
+    question: str
+    eval_model: str = "claude-haiku-4-5"
+
+
+class RagJudgeRequest(BaseModel):
+    question: str
+    answer: str
+    chunks: list[dict[str, object]]
+    eval_model: str = "claude-haiku-4-5"
 
 
 # ---------------------------------------------------------------------------
@@ -804,24 +817,29 @@ async def chat(body: ChatRequest) -> EventSourceResponse:
 
 
 @app.post("/library/chat")
-async def library_chat(body: LibraryChatRequest) -> EventSourceResponse:
-    """RAG chatbot over all completed research reports (Layer 4: long-term memory).
+async def library_chat(body: LibraryChatRequest, request: Request) -> EventSourceResponse:
+    """RAG chatbot over the calling visitor's completed research reports.
 
+    Scoped to the X-Client-Id header — each visitor only searches their own reports.
     Two-stage retrieval:
       Stage 1 — LLM scans report titles/queries, selects topically relevant run_ids.
       Stage 2 — semantic search scoped to those run_ids with a similarity cutoff.
     """
     assert _session_factory is not None
+    client_id = _client_id(request)
 
     async def stream() -> AsyncGenerator[dict[str, str], None]:
         try:
-            # Fetch all completed runs so Stage 1 can filter by metadata
+            # Fetch only this visitor's completed runs for Stage 1 metadata filter
             async with _session_factory() as session:
-                rows = await session.execute(
+                stmt = (
                     select(ResearchRun.id, ResearchRun.title, ResearchRun.query)
-                    .where(ResearchRun.status == "completed")
+                    .where(ResearchRun.status == "done")
                     .order_by(ResearchRun.started_at.desc())
                 )
+                if client_id is not None:
+                    stmt = stmt.where(ResearchRun.client_id == client_id)
+                rows = await session.execute(stmt)
                 available_reports = [
                     {"run_id": str(r.id), "title": r.title or r.query, "query": r.query}
                     for r in rows
@@ -858,3 +876,102 @@ async def library_chat(body: LibraryChatRequest) -> EventSourceResponse:
             yield _evt({"type": "error", "message": str(exc)})
 
     return EventSourceResponse(stream())
+
+
+@app.post("/library/eval")
+async def library_eval(body: RagEvalRequest, request: Request) -> dict[str, object]:
+    """Evaluate RAG retrieval + generation quality for one question.
+
+    Scoped to the calling visitor's runs (same as /library/chat).
+    """
+    assert _session_factory is not None
+    client_id = _client_id(request)
+
+    async with _session_factory() as session:
+        stmt = (
+            select(ResearchRun.id, ResearchRun.title, ResearchRun.query)
+            .where(ResearchRun.status == "done")
+            .order_by(ResearchRun.started_at.desc())
+        )
+        if client_id is not None:
+            stmt = stmt.where(ResearchRun.client_id == client_id)
+        rows = await session.execute(stmt)
+        available_reports = [
+            {"run_id": str(r.id), "title": r.title or r.query, "query": r.query}
+            for r in rows
+        ]
+
+    report = await evaluate_rag(body.question, available_reports, body.eval_model)
+    return report.model_dump()
+
+
+@app.post("/library/eval/judge")
+async def library_eval_judge(body: RagJudgeRequest) -> dict[str, object]:
+    """Judge precision + faithfulness on already-retrieved chunks and answer.
+
+    Skips Stage 1 + Stage 2 retrieval — call this after /library/chat so the
+    eval runs on exactly the chunks the user saw, with no redundant LLM calls.
+    """
+    import asyncio as _asyncio
+
+    from engine.models import estimate_cost_usd as _cost
+    from eval.rag_context_precision import run_context_precision
+    from eval.rag_faithfulness import run_rag_faithfulness
+
+    (precision_verdicts, context_precision, precision_usage), \
+    (faithfulness_verdicts, answer_faithfulness, faithfulness_usage) = await _asyncio.gather(
+        run_context_precision(body.question, body.chunks, body.eval_model),
+        run_rag_faithfulness(body.answer, body.chunks, body.eval_model),
+    )
+    all_usage = [*precision_usage, *faithfulness_usage]
+    return {
+        "question": body.question,
+        "chunks_retrieved": len(body.chunks),
+        "chunk_verdicts": [v.model_dump() for v in precision_verdicts],
+        "context_precision": context_precision,
+        "claim_verdicts": [v.model_dump() for v in faithfulness_verdicts],
+        "answer_faithfulness": answer_faithfulness,
+        "eval_cost_usd": _cost(all_usage),
+    }
+
+
+@app.post("/library/reindex")
+async def library_reindex(request: Request) -> dict[str, object]:
+    """Re-index the calling visitor's completed runs into pgvector.
+
+    Scoped to the X-Client-Id header. Safe to call multiple times — deletes
+    existing chunks before re-indexing to avoid duplicates.
+    """
+    assert _session_factory is not None
+    assert _graph is not None
+    client_id = _client_id(request)
+
+    async with _session_factory() as session:
+        stmt = (
+            select(ResearchRun.id, ResearchRun.title, ResearchRun.query)
+            .where(ResearchRun.status == "done")
+            .order_by(ResearchRun.started_at.desc())
+        )
+        if client_id is not None:
+            stmt = stmt.where(ResearchRun.client_id == client_id)
+        rows = await session.execute(stmt)
+        runs = [(str(r.id), r.title or r.query, r.query) for r in rows]
+
+    indexed = 0
+    failed: list[dict[str, str]] = []
+
+    for run_id, title, query in runs:
+        try:
+            config: dict = {"configurable": {"thread_id": run_id}}
+            snapshot = await _graph.aget_state(config)
+            report: str = snapshot.values.get("report", "")
+            if not report:
+                failed.append({"run_id": run_id, "reason": "no report in checkpoint state"})
+                continue
+            await rag.delete_chunks(run_id)
+            await rag.embed_and_store(run_id, report, title, query)
+            indexed += 1
+        except Exception as exc:
+            failed.append({"run_id": run_id, "reason": str(exc)})
+
+    return {"indexed": indexed, "total": len(runs), "failed": failed}

@@ -14,6 +14,18 @@ type LibraryStepType  = 'searching' | 'chunks_retrieved' | 'generating' | 'done'
 interface LibraryStep  { id: number; type: LibraryStepType; label: string; detail?: string; ts: string; }
 interface RetrievedChunk { content: string; title: string; run_id: string; }
 
+interface LibraryChunkVerdict { chunk_index: number; title: string; section: string; preview: string; relevant: boolean; reasoning: string; }
+interface LibraryClaimVerdict { claim: string; supported: boolean; reasoning: string; }
+interface LibraryEvalResult {
+  question: string;
+  chunks_retrieved: number;
+  chunk_verdicts: LibraryChunkVerdict[];
+  context_precision: number;
+  claim_verdicts: LibraryClaimVerdict[];
+  answer_faithfulness: number;
+  eval_cost_usd: number;
+}
+
 interface SubtaskState { question: string; status: 'pending' | 'done'; findingsCount: number; }
 interface ChatMessage  { role: 'user' | 'assistant'; content: string; }
 interface LibraryChatMessage { role: 'user' | 'assistant'; content: string; sources?: LibrarySource[]; }
@@ -140,6 +152,16 @@ function SendIcon({ className = 'w-4 h-4' }: { className?: string }) {
       strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M22 2L11 13" /><path d="M22 2L15 22L11 13L2 9L22 2Z" />
     </svg>
+  );
+}
+
+function ScorePill({ label, value }: { label: string; value: number }) {
+  const pct = Math.round(value * 100);
+  const color = pct >= 80 ? 'bg-emerald-100 text-emerald-700' : pct >= 50 ? 'bg-amber-100 text-amber-700' : 'bg-red-100 text-red-600';
+  return (
+    <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold ${color}`}>
+      {label} {pct}%
+    </span>
   );
 }
 
@@ -617,7 +639,10 @@ export default function Home() {
   const [libraryChatStreaming, setLibraryChatStreaming] = useState(false);
   const [librarySteps,         setLibrarySteps]         = useState<LibraryStep[]>([]);
   const [libraryChunks,        setLibraryChunks]        = useState<RetrievedChunk[]>([]);
-  const [libraryRightTab,      setLibraryRightTab]      = useState<'steps' | 'chunks'>('steps');
+  const [libraryRightTab,      setLibraryRightTab]      = useState<'steps' | 'chunks' | 'eval'>('steps');
+  const [libraryEvalResult,    setLibraryEvalResult]    = useState<LibraryEvalResult | null>(null);
+  const [libraryEvalLoading,   setLibraryEvalLoading]   = useState(false);
+  const [expandedChunks,       setExpandedChunks]       = useState<Set<number>>(new Set());
   const [showLibraryActivityMobile, setShowLibraryActivityMobile] = useState(false);
 
   // Top-level view: research flow (default) vs eval dashboard vs RAG library
@@ -1205,9 +1230,13 @@ export default function Home() {
     setLibraryChatStreaming(true);
     setLibraryChunks([]);
     setLibraryRightTab('steps');
+    setLibraryEvalResult(null);
+    setLibraryEvalLoading(false);
+    setExpandedChunks(new Set());
     const historySnap = [...libraryChatMessages];
     setLibraryChatMessages(prev => [...prev, { role: 'user', content: q }, { role: 'assistant', content: '' }]);
     let reply = '';
+    let capturedChunks: RetrievedChunk[] = [];
     const addStep = (type: LibraryStepType, label: string, detail?: string) =>
       setLibrarySteps(prev => [...prev, { id: ++libraryStepIdRef.current, type, label, detail, ts: nowTs() }]);
     try {
@@ -1225,6 +1254,7 @@ export default function Home() {
           addStep('searching', 'Thinking', 'Searching indexed reports…');
         } else if (data.type === 'chunks_retrieved') {
           const chunks = (data.chunks as RetrievedChunk[]) ?? [];
+          capturedChunks = chunks;
           setLibraryChunks(chunks);
           const titles = [...new Set(chunks.map(c => c.title))];
           addStep('chunks_retrieved', `${chunks.length} Chunks Retrieved`,
@@ -1253,7 +1283,29 @@ export default function Home() {
         ...prev.slice(0, -1),
         { role: 'assistant', content: `Error: ${String(e)}` },
       ]);
-    } finally { setLibraryChatStreaming(false); }
+    } finally {
+      setLibraryChatStreaming(false);
+    }
+
+    // Non-blocking auto eval — runs after answer is fully streamed.
+    // Evaluates exactly the chunks the user saw (no duplicate retrieval).
+    if (reply && capturedChunks.length > 0) {
+      setLibraryEvalLoading(true);
+      fetch(`${API}/library/eval/judge`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question: q, answer: reply, chunks: capturedChunks }),
+      })
+        .then(r => r.ok ? r.json() : null)
+        .then((data: LibraryEvalResult | null) => {
+          if (data) {
+            setLibraryEvalResult(data);
+            setLibraryRightTab('eval');
+          }
+        })
+        .catch(() => { /* eval failure is silent — chat answer still usable */ })
+        .finally(() => setLibraryEvalLoading(false));
+    }
   }
 
   function reset() {
@@ -1540,7 +1592,9 @@ export default function Home() {
                       </div>
                     </div>
                   ) : (
-                    libraryChatMessages.map((m, i) => (
+                    libraryChatMessages.map((m, i) => {
+                      const isLastAssistant = m.role === 'assistant' && i === libraryChatMessages.length - 1;
+                      return (
                       <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                         <div className={`text-sm rounded-xl px-4 py-2.5 max-w-[85%] sm:max-w-[75%] ${
                           m.role === 'user' ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-800'
@@ -1570,6 +1624,25 @@ export default function Home() {
                                     ))}
                                   </div>
                                 )}
+                                {/* Auto eval score pills — shown only on latest assistant message */}
+                                {isLastAssistant && (libraryEvalLoading || libraryEvalResult) && (
+                                  <div className="mt-2.5 pt-2 border-t border-gray-200">
+                                    {libraryEvalLoading ? (
+                                      <span className="flex items-center gap-1.5 text-[11px] text-gray-400">
+                                        <Spinner /> Evaluating…
+                                      </span>
+                                    ) : libraryEvalResult && (
+                                      <button
+                                        onClick={() => setLibraryRightTab('eval')}
+                                        className="flex items-center gap-2 text-[11px] hover:opacity-80 transition-opacity"
+                                        title="Click to see full eval breakdown"
+                                      >
+                                        <ScorePill label="Precision" value={libraryEvalResult.context_precision} />
+                                        <ScorePill label="Faithfulness" value={libraryEvalResult.answer_faithfulness} />
+                                      </button>
+                                    )}
+                                  </div>
+                                )}
                               </>
                             ) : (
                               <span className="flex items-center gap-1.5 text-gray-400 text-xs">
@@ -1579,7 +1652,8 @@ export default function Home() {
                           ) : m.content}
                         </div>
                       </div>
-                    ))
+                      );
+                    })
                   )}
                   <div ref={libraryChatEndRef} />
                 </div>
@@ -1610,7 +1684,7 @@ export default function Home() {
               <div className={`min-h-0 w-full lg:w-[300px] flex-1 lg:flex-none border-t lg:border-t-0 lg:border-l border-gray-200 bg-gray-50 flex-col ${showLibraryActivityMobile ? 'flex' : 'hidden lg:flex'}`}>
                 {/* Tab bar */}
                 <div className="flex border-b border-gray-200 text-xs font-semibold flex-shrink-0">
-                  {(['steps', 'chunks'] as const).map(tab => (
+                  {(['steps', 'chunks', 'eval'] as const).map(tab => (
                     <button
                       key={tab}
                       onClick={() => setLibraryRightTab(tab)}
@@ -1627,12 +1701,19 @@ export default function Home() {
                           </svg>
                           Steps
                         </>
-                      ) : (
+                      ) : tab === 'chunks' ? (
                         <>
                           <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                             <path strokeLinecap="round" strokeLinejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
                           </svg>
                           {`Chunks${libraryChunks.length ? ` (${libraryChunks.length})` : ''}`}
+                        </>
+                      ) : (
+                        <>
+                          <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+                          </svg>
+                          {libraryEvalLoading ? 'Eval…' : 'Eval'}
                         </>
                       )}
                     </button>
@@ -1640,7 +1721,92 @@ export default function Home() {
                 </div>
 
                 {/* Tab content */}
-                {libraryRightTab === 'steps' ? (
+                {libraryRightTab === 'eval' ? (
+                  <div className="flex-1 overflow-y-auto">
+                    {libraryEvalLoading ? (
+                      <div className="flex items-center justify-center gap-2 pt-8 text-xs text-gray-400">
+                        <Spinner /> Evaluating answer quality…
+                      </div>
+                    ) : libraryEvalResult ? (
+                      <div className="px-3 py-3 space-y-3">
+                        {/* Score cards */}
+                        <div className="grid grid-cols-2 gap-2">
+                          {[
+                            { label: 'Context Precision', value: libraryEvalResult.context_precision, sub: `${libraryEvalResult.chunk_verdicts.filter(v => v.relevant).length}/${libraryEvalResult.chunk_verdicts.length} chunks relevant` },
+                            { label: 'Answer Faithfulness', value: libraryEvalResult.answer_faithfulness, sub: `${libraryEvalResult.claim_verdicts.filter(v => v.supported).length}/${libraryEvalResult.claim_verdicts.length} claims supported` },
+                          ].map(({ label, value, sub }) => {
+                            const pct = Math.round(value * 100);
+                            const bar = pct >= 80 ? 'bg-emerald-500' : pct >= 50 ? 'bg-amber-400' : 'bg-red-400';
+                            return (
+                              <div key={label} className="bg-white border border-gray-200 rounded-xl px-3 py-2.5">
+                                <p className="text-[10px] uppercase tracking-wide text-gray-400 font-semibold leading-tight">{label}</p>
+                                <p className="text-xl font-bold text-gray-900 mt-1">{pct}%</p>
+                                <div className="w-full bg-gray-100 rounded-full h-1 mt-1.5">
+                                  <div className={`h-1 rounded-full ${bar}`} style={{ width: `${pct}%` }} />
+                                </div>
+                                <p className="text-[10px] text-gray-400 mt-1">{sub}</p>
+                              </div>
+                            );
+                          })}
+                        </div>
+
+                        {/* Chunk verdicts */}
+                        {libraryEvalResult.chunk_verdicts.length > 0 && (
+                          <div>
+                            <p className="text-[10px] uppercase tracking-wide text-gray-400 font-semibold mb-1.5">Retrieved Chunks</p>
+                            <div className="space-y-1.5">
+                              {libraryEvalResult.chunk_verdicts.map((v, i) => (
+                                <div key={i} className="bg-white border border-gray-200 rounded-lg px-2.5 py-2">
+                                  <div className="flex items-start gap-1.5">
+                                    <span className={`mt-0.5 flex-shrink-0 w-3.5 h-3.5 rounded-full flex items-center justify-center ${v.relevant ? 'bg-emerald-100' : 'bg-red-100'}`}>
+                                      <span className={`text-[8px] font-bold ${v.relevant ? 'text-emerald-600' : 'text-red-500'}`}>{v.relevant ? '✓' : '✗'}</span>
+                                    </span>
+                                    <div className="min-w-0 flex-1">
+                                      <p className="text-[11px] font-medium text-gray-700 truncate">{v.title}</p>
+                                      {v.section && v.section !== '/' && <p className="text-[10px] text-indigo-400 truncate">{v.section}</p>}
+                                      <p className="text-[10px] text-gray-500 mt-0.5 line-clamp-2">{v.preview}</p>
+                                      {!v.relevant && <p className="text-[10px] text-red-500 mt-0.5">{v.reasoning}</p>}
+                                    </div>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Claim verdicts */}
+                        {libraryEvalResult.claim_verdicts.length > 0 && (
+                          <div>
+                            <p className="text-[10px] uppercase tracking-wide text-gray-400 font-semibold mb-1.5">Answer Claims</p>
+                            <div className="space-y-1.5">
+                              {libraryEvalResult.claim_verdicts.map((v, i) => (
+                                <div key={i} className="bg-white border border-gray-200 rounded-lg px-2.5 py-2">
+                                  <div className="flex items-start gap-1.5">
+                                    <span className={`mt-0.5 flex-shrink-0 w-3.5 h-3.5 rounded-full flex items-center justify-center ${v.supported ? 'bg-emerald-100' : 'bg-red-100'}`}>
+                                      <span className={`text-[8px] font-bold ${v.supported ? 'text-emerald-600' : 'text-red-500'}`}>{v.supported ? '✓' : '✗'}</span>
+                                    </span>
+                                    <div className="min-w-0 flex-1">
+                                      <p className="text-[10px] text-gray-700 leading-relaxed">{v.claim}</p>
+                                      {!v.supported && <p className="text-[10px] text-red-500 mt-0.5">{v.reasoning}</p>}
+                                    </div>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        <p className="text-[10px] text-gray-400 text-center pb-1">
+                          Eval cost: ${libraryEvalResult.eval_cost_usd.toFixed(4)}
+                        </p>
+                      </div>
+                    ) : (
+                      <p className="text-xs text-gray-400 text-center pt-8 px-4">
+                        Eval scores will appear here after you ask a question.
+                      </p>
+                    )}
+                  </div>
+                ) : libraryRightTab === 'steps' ? (
                   <div className="flex-1 overflow-y-auto">
                     {librarySteps.length === 0 ? (
                       <p className="text-xs text-gray-400 text-center pt-8 px-4">
@@ -1690,21 +1856,34 @@ export default function Home() {
                       </p>
                     ) : (
                       <div className="px-3 py-3 space-y-2.5">
-                        {libraryChunks.map((chunk, i) => (
-                          <div key={i} className="bg-white border border-gray-200 rounded-xl px-3 py-2.5 shadow-sm">
-                            <div className="flex items-center gap-1.5 mb-1.5">
-                              <span className="text-[10px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-1.5 py-0.5">
-                                #{i + 1}
-                              </span>
-                              <span className="text-[11px] font-semibold text-gray-700 truncate">
-                                {chunk.title || 'Untitled Report'}
-                              </span>
+                        {libraryChunks.map((chunk, i) => {
+                          const expanded = expandedChunks.has(i);
+                          return (
+                            <div key={i} className="bg-white border border-gray-200 rounded-xl px-3 py-2.5 shadow-sm">
+                              <div className="flex items-center gap-1.5 mb-1.5">
+                                <span className="text-[10px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100 rounded-full px-1.5 py-0.5">
+                                  #{i + 1}
+                                </span>
+                                <span className="text-[11px] font-semibold text-gray-700 truncate flex-1">
+                                  {chunk.title || 'Untitled Report'}
+                                </span>
+                                <button
+                                  onClick={() => setExpandedChunks(prev => {
+                                    const next = new Set(prev);
+                                    expanded ? next.delete(i) : next.add(i);
+                                    return next;
+                                  })}
+                                  className="flex-shrink-0 text-[10px] text-indigo-500 hover:text-indigo-700 font-medium transition-colors"
+                                >
+                                  {expanded ? 'Collapse' : 'Expand'}
+                                </button>
+                              </div>
+                              <p className={`text-[11px] text-gray-500 leading-relaxed whitespace-pre-wrap ${expanded ? '' : 'line-clamp-4'}`}>
+                                {chunk.content}
+                              </p>
                             </div>
-                            <p className="text-[11px] text-gray-500 leading-relaxed line-clamp-4">
-                              {chunk.content}
-                            </p>
-                          </div>
-                        ))}
+                          );
+                        })}
                       </div>
                     )}
                   </div>

@@ -204,6 +204,7 @@ async def search_in_reports(
             "run_id": node.metadata.get("run_id", ""),
             "title": node.metadata.get("title", ""),
             "query": node.metadata.get("query", ""),
+            "section": node.metadata.get("header_path", ""),
         }
         for node in nodes
     ]
@@ -255,6 +256,7 @@ async def search(question: str, limit: int = 5) -> list[dict[str, object]]:
             "run_id": node.metadata.get("run_id", ""),
             "title": node.metadata.get("title", ""),
             "query": node.metadata.get("query", ""),
+            "section": node.metadata.get("header_path", ""),
         }
         for node in nodes
     ]
