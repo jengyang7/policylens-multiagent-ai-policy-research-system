@@ -21,6 +21,16 @@ interface RagAnswerClaimVerdict {
   reasoning: string;
 }
 
+interface RagContextSufficiencyVerdict {
+  sufficient: boolean;
+  reasoning: string;
+}
+
+interface RagAnswerRelevanceVerdict {
+  score: number;
+  reasoning: string;
+}
+
 interface RagEvalReport {
   question: string;
   generated_at: string;
@@ -28,9 +38,13 @@ interface RagEvalReport {
   chunks_retrieved: number;
   chunk_verdicts: RagChunkVerdict[];
   context_precision: number;
+  context_sufficiency: number;
+  context_sufficiency_verdict: RagContextSufficiencyVerdict;
   answer: string;
   claim_verdicts: RagAnswerClaimVerdict[];
   answer_faithfulness: number;
+  answer_relevance: number;
+  answer_relevance_verdict: RagAnswerRelevanceVerdict;
   eval_model: string;
   eval_cost_usd: number;
   eval_input_tokens: number;
@@ -112,6 +126,18 @@ interface UncitedSentence {
   section: string;
 }
 
+interface CitationCoverageIssue {
+  sentence: string;
+  section: string;
+  reasoning: string;
+}
+
+interface CitationCoverageResult {
+  coverage_score: number;
+  cited_sentence_count: number;
+  uncited_factual_claims: CitationCoverageIssue[];
+}
+
 interface SubtopicCoverage {
   subtopic: string;
   covered: boolean;
@@ -133,6 +159,7 @@ interface EvalReportDetail extends EvalReportSummary {
     grounding_results: GroundingResult[];
     faithfulness_results: FaithfulnessVerdict[];
     uncited_sentences: UncitedSentence[];
+    citation_coverage?: CitationCoverageResult;
     completeness: CompletenessResult;
     relevance: RelevanceResult;
   };
@@ -376,7 +403,14 @@ function DetailPanel({ detail, loading }: { detail: EvalReportDetail | null; loa
     );
   }
 
-  const { grounding_results, faithfulness_results, uncited_sentences, completeness, relevance } = detail.report;
+  const {
+    grounding_results,
+    faithfulness_results,
+    uncited_sentences,
+    citation_coverage,
+    completeness,
+    relevance,
+  } = detail.report;
 
   return (
     <div className="space-y-5">
@@ -488,6 +522,28 @@ function DetailPanel({ detail, loading }: { detail: EvalReportDetail | null; loa
           </div>
         )}
       </div>
+
+      {/* Citation coverage */}
+      {citation_coverage && (
+        <div>
+          <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-1.5">
+            Citation Coverage ({fmtPct(citation_coverage.coverage_score * 100)})
+          </p>
+          {citation_coverage.uncited_factual_claims.length === 0 ? (
+            <p className="text-xs text-gray-400">No uncited factual claims were flagged.</p>
+          ) : (
+            <div className="space-y-1.5">
+              {citation_coverage.uncited_factual_claims.map((issue, i) => (
+                <div key={i} className="bg-white border border-red-200 rounded-lg px-3 py-2">
+                  <p className="text-xs text-gray-700 line-clamp-2">{issue.sentence}</p>
+                  <p className="text-[10px] text-red-500 mt-0.5">{issue.reasoning}</p>
+                  {issue.section && <p className="text-[10px] text-gray-400 mt-0.5">{issue.section}</p>}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -508,11 +564,12 @@ function RagEvalResultPanel({ result }: { result: RagEvalReport }) {
   const [showAnswer, setShowAnswer] = useState(false);
   const precisionColor = result.context_precision >= 0.8 ? 'bg-emerald-500' : result.context_precision >= 0.5 ? 'bg-amber-400' : 'bg-red-400';
   const faithColor = result.answer_faithfulness >= 0.8 ? 'bg-emerald-500' : result.answer_faithfulness >= 0.5 ? 'bg-amber-400' : 'bg-red-400';
+  const relevanceColor = result.answer_relevance >= 0.8 ? 'bg-emerald-500' : result.answer_relevance >= 0.5 ? 'bg-amber-400' : 'bg-red-400';
 
   return (
     <div className="space-y-4 pt-2 border-t border-gray-100">
       {/* Score cards */}
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <div className="bg-gray-50 border border-gray-200 rounded-xl px-4 py-3">
           <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold">Context Precision</p>
           <p className="text-2xl font-bold text-gray-900 mt-1">{fmtPct(result.context_precision * 100)}</p>
@@ -522,11 +579,27 @@ function RagEvalResultPanel({ result }: { result: RagEvalReport }) {
           </p>
         </div>
         <div className="bg-gray-50 border border-gray-200 rounded-xl px-4 py-3">
+          <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold">Context Sufficiency</p>
+          <p className="text-2xl font-bold text-gray-900 mt-1">{fmtPct(result.context_sufficiency * 100)}</p>
+          <ScoreBar value={result.context_sufficiency} color={result.context_sufficiency >= 1 ? 'bg-emerald-500' : 'bg-red-400'} />
+          <p className="text-[10px] text-gray-400 mt-1.5 line-clamp-2">
+            {result.context_sufficiency_verdict.reasoning}
+          </p>
+        </div>
+        <div className="bg-gray-50 border border-gray-200 rounded-xl px-4 py-3">
           <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold">Answer Faithfulness</p>
           <p className="text-2xl font-bold text-gray-900 mt-1">{fmtPct(result.answer_faithfulness * 100)}</p>
           <ScoreBar value={result.answer_faithfulness} color={faithColor} />
           <p className="text-[10px] text-gray-400 mt-1.5">
             {result.claim_verdicts.filter(v => v.supported).length}/{result.claim_verdicts.length} claims supported
+          </p>
+        </div>
+        <div className="bg-gray-50 border border-gray-200 rounded-xl px-4 py-3">
+          <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold">Answer Relevance</p>
+          <p className="text-2xl font-bold text-gray-900 mt-1">{fmtPct(result.answer_relevance * 100)}</p>
+          <ScoreBar value={result.answer_relevance} color={relevanceColor} />
+          <p className="text-[10px] text-gray-400 mt-1.5 line-clamp-2">
+            {result.answer_relevance_verdict.reasoning}
           </p>
         </div>
       </div>

@@ -308,7 +308,12 @@ def test_role_defaults_fall_back_without_provider_keys(
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     defaults = role_default_models()
-    assert defaults == {"lead": "gpt-5.4", "advocate": "gpt-5.4", "skeptic": "gpt-5.4", "eval": "gpt-5.4"}
+    assert defaults == {
+        "lead": "gpt-5.4",
+        "advocate": "gpt-5.4",
+        "skeptic": "gpt-5.4",
+        "eval": "gpt-5.4",
+    }
 
 
 def test_role_defaults_use_cross_provider_models_when_available(

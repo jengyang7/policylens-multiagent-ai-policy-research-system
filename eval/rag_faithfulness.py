@@ -65,13 +65,13 @@ async def run_rag_faithfulness(
     Returns (verdicts, faithfulness_score, token_usage).
     faithfulness_score = supported / total (1.0 when there are no claims to check).
     """
-    if not answer.strip() or not chunks:
+    if not answer.strip():
         return [], 1.0, []
 
     context = "\n\n---\n\n".join(
         f"[Chunk {i + 1} — {c.get('title', '')}]\n{c['content']}"
         for i, c in enumerate(chunks)
-    )
+    ) or "(no source chunks were retrieved)"
 
     judge_llm = make_chat_model(eval_model, temperature=0)
     token_usage: list[TokenUsage] = []
@@ -89,6 +89,17 @@ async def run_rag_faithfulness(
 
     if not claim_list.claims:
         return [], 1.0, token_usage
+
+    if not chunks:
+        unsupported_verdicts = [
+            RagAnswerClaimVerdict(
+                claim=claim,
+                supported=False,
+                reasoning="No source chunks were retrieved, so this factual claim is unsupported.",
+            )
+            for claim in claim_list.claims
+        ]
+        return unsupported_verdicts, 0.0, token_usage
 
     # Step 2: judge each claim concurrently
     faith_chain = _FAITH_PROMPT | judge_llm.with_structured_output(

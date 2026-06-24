@@ -16,19 +16,31 @@ interface RetrievedChunk { content: string; title: string; run_id: string; }
 
 interface LibraryChunkVerdict { chunk_index: number; title: string; section: string; preview: string; relevant: boolean; reasoning: string; }
 interface LibraryClaimVerdict { claim: string; supported: boolean; reasoning: string; }
+interface LibrarySufficiencyVerdict { sufficient: boolean; reasoning: string; }
+interface LibraryAnswerRelevanceVerdict { score: number; reasoning: string; }
 interface LibraryEvalResult {
   question: string;
   chunks_retrieved: number;
   chunk_verdicts: LibraryChunkVerdict[];
   context_precision: number;
+  context_sufficiency: number;
+  context_sufficiency_verdict: LibrarySufficiencyVerdict;
   claim_verdicts: LibraryClaimVerdict[];
   answer_faithfulness: number;
+  answer_relevance: number;
+  answer_relevance_verdict: LibraryAnswerRelevanceVerdict;
   eval_cost_usd: number;
 }
 
 interface SubtaskState { question: string; status: 'pending' | 'done'; findingsCount: number; }
 interface ChatMessage  { role: 'user' | 'assistant'; content: string; }
-interface LibraryChatMessage { role: 'user' | 'assistant'; content: string; sources?: LibrarySource[]; }
+interface LibraryChatMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  sources?: LibrarySource[];
+  evalResult?: LibraryEvalResult;
+  evalLoading?: boolean;
+}
 interface LogEntry     { id: number; type: LogType; label: string; detail?: string; ts: string; createdAt: number; serverTs?: number; }
 interface ModelOption  { id: string; label: string; description: string; }
 interface DebateTurn   { agent: 'advocate' | 'skeptic'; model: string; round: number; content: string; }
@@ -652,11 +664,15 @@ export default function Home() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showActivityMobile, setShowActivityMobile] = useState(false);
 
-  // Mirrors engine/models.py LEAD_MODEL_OPTIONS — lets the picker render
-  // immediately, before the (possibly cold-starting) backend responds.
+  // Mirrors engine/models.py MODEL_OPTIONS — lets the picker render immediately,
+  // before the (possibly cold-starting) backend responds with provider-gated availability.
   const [modelOptions, setModelOptions] = useState<ModelOption[]>([
     { id: 'gpt-5.4', label: 'GPT-5.4', description: 'Best for complex topics' },
     { id: 'gpt-5.4-mini', label: 'GPT-5.4 Mini', description: 'Faster and cheaper' },
+    { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6', description: 'Strong evidence-grounded reasoning' },
+    { id: 'claude-haiku-4-5', label: 'Claude Haiku 4.5', description: 'Fast and cost-effective' },
+    { id: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro', description: 'Top-tier reasoning from Google' },
+    { id: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash', description: 'Fast frontier model from Google' },
   ]);
   const [selectedModel, setSelectedModel] = useState('gpt-5.4');
 
@@ -664,8 +680,8 @@ export default function Home() {
   const [debateMode,     setDebateMode]     = useState(false);
   const [debateInfoOpen, setDebateInfoOpen] = useState(false);
   const debateInfoRef = useRef<HTMLDivElement>(null);
-  const [advocateModel,  setAdvocateModel]  = useState('gpt-5.4');
-  const [skepticModel,   setSkepticModel]   = useState('gpt-5.4');
+  const [advocateModel,  setAdvocateModel]  = useState('claude-sonnet-4-6');
+  const [skepticModel,   setSkepticModel]   = useState('gemini-3.1-pro-preview');
   const [debateTurns,    setDebateTurns]    = useState<DebateTurn[]>([]);
   const [debateExpanded, setDebateExpanded] = useState(true);
   const [debatingActive, setDebatingActive] = useState(false);
@@ -1234,6 +1250,7 @@ export default function Home() {
     setLibraryEvalLoading(false);
     setExpandedChunks(new Set());
     const historySnap = [...libraryChatMessages];
+    const assistantMessageIndex = historySnap.length + 1;
     setLibraryChatMessages(prev => [...prev, { role: 'user', content: q }, { role: 'assistant', content: '' }]);
     let reply = '';
     let capturedChunks: RetrievedChunk[] = [];
@@ -1289,8 +1306,11 @@ export default function Home() {
 
     // Non-blocking auto eval — runs after answer is fully streamed.
     // Evaluates exactly the chunks the user saw (no duplicate retrieval).
-    if (reply && capturedChunks.length > 0) {
+    if (reply) {
       setLibraryEvalLoading(true);
+      setLibraryChatMessages(prev => prev.map((m, i) =>
+        i === assistantMessageIndex ? { ...m, evalLoading: true } : m
+      ));
       fetch(`${API}/library/eval/judge`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1301,10 +1321,24 @@ export default function Home() {
           if (data) {
             setLibraryEvalResult(data);
             setLibraryRightTab('eval');
+            setLibraryChatMessages(prev => prev.map((m, i) =>
+              i === assistantMessageIndex
+                ? { ...m, evalResult: data, evalLoading: false }
+                : m
+            ));
           }
         })
-        .catch(() => { /* eval failure is silent — chat answer still usable */ })
-        .finally(() => setLibraryEvalLoading(false));
+        .catch(() => {
+          setLibraryChatMessages(prev => prev.map((m, i) =>
+            i === assistantMessageIndex ? { ...m, evalLoading: false } : m
+          ));
+        })
+        .finally(() => {
+          setLibraryEvalLoading(false);
+          setLibraryChatMessages(prev => prev.map((m, i) =>
+            i === assistantMessageIndex ? { ...m, evalLoading: false } : m
+          ));
+        });
     }
   }
 
@@ -1593,7 +1627,6 @@ export default function Home() {
                     </div>
                   ) : (
                     libraryChatMessages.map((m, i) => {
-                      const isLastAssistant = m.role === 'assistant' && i === libraryChatMessages.length - 1;
                       return (
                       <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                         <div className={`text-sm rounded-xl px-4 py-2.5 max-w-[85%] sm:max-w-[75%] ${
@@ -1624,21 +1657,26 @@ export default function Home() {
                                     ))}
                                   </div>
                                 )}
-                                {/* Auto eval score pills — shown only on latest assistant message */}
-                                {isLastAssistant && (libraryEvalLoading || libraryEvalResult) && (
+                                {/* Auto eval score pills — stored on this assistant message */}
+                                {(m.evalLoading || m.evalResult) && (
                                   <div className="mt-2.5 pt-2 border-t border-gray-200">
-                                    {libraryEvalLoading ? (
+                                    {m.evalLoading ? (
                                       <span className="flex items-center gap-1.5 text-[11px] text-gray-400">
                                         <Spinner /> Evaluating…
                                       </span>
-                                    ) : libraryEvalResult && (
+                                    ) : m.evalResult && (
                                       <button
-                                        onClick={() => setLibraryRightTab('eval')}
+                                        onClick={() => {
+                                          setLibraryEvalResult(m.evalResult ?? null);
+                                          setLibraryRightTab('eval');
+                                        }}
                                         className="flex items-center gap-2 text-[11px] hover:opacity-80 transition-opacity"
                                         title="Click to see full eval breakdown"
                                       >
-                                        <ScorePill label="Precision" value={libraryEvalResult.context_precision} />
-                                        <ScorePill label="Faithfulness" value={libraryEvalResult.answer_faithfulness} />
+                                        <ScorePill label="Precision" value={m.evalResult.context_precision} />
+                                        <ScorePill label="Sufficiency" value={m.evalResult.context_sufficiency} />
+                                        <ScorePill label="Faithfulness" value={m.evalResult.answer_faithfulness} />
+                                        <ScorePill label="Relevance" value={m.evalResult.answer_relevance} />
                                       </button>
                                     )}
                                   </div>
@@ -1733,7 +1771,9 @@ export default function Home() {
                         <div className="grid grid-cols-2 gap-2">
                           {[
                             { label: 'Context Precision', value: libraryEvalResult.context_precision, sub: `${libraryEvalResult.chunk_verdicts.filter(v => v.relevant).length}/${libraryEvalResult.chunk_verdicts.length} chunks relevant` },
+                            { label: 'Context Sufficiency', value: libraryEvalResult.context_sufficiency, sub: libraryEvalResult.context_sufficiency_verdict.reasoning },
                             { label: 'Answer Faithfulness', value: libraryEvalResult.answer_faithfulness, sub: `${libraryEvalResult.claim_verdicts.filter(v => v.supported).length}/${libraryEvalResult.claim_verdicts.length} claims supported` },
+                            { label: 'Answer Relevance', value: libraryEvalResult.answer_relevance, sub: libraryEvalResult.answer_relevance_verdict.reasoning },
                           ].map(({ label, value, sub }) => {
                             const pct = Math.round(value * 100);
                             const bar = pct >= 80 ? 'bg-emerald-500' : pct >= 50 ? 'bg-amber-400' : 'bg-red-400';

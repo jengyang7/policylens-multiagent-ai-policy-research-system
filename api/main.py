@@ -9,6 +9,7 @@ import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from dotenv import load_dotenv
@@ -39,7 +40,7 @@ from engine.state import TokenUsage
 from eval.harness import evaluate_run
 from eval.rag_eval import evaluate_rag
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 
 def _async_engine_from_url(raw: str):
@@ -86,7 +87,11 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
 
 app = FastAPI(title="Deep Research API", lifespan=lifespan)
 
-_allowed_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if o.strip()]
+_allowed_origins = [
+    o.strip()
+    for o in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+    if o.strip()
+]
 
 app.add_middleware(
     CORSMiddleware,
@@ -192,14 +197,27 @@ def _eval_record_summary(record: EvalReportRecord) -> dict[str, object]:
 # Report persistence + RAG ingest (Layer 4: long-term memory)
 # ---------------------------------------------------------------------------
 
-async def _save_and_embed_report(run_id: str, content: str) -> None:
+async def _save_and_embed_report(
+    run_id: str,
+    content: str,
+    findings: list[dict[str, object]] | None = None,
+) -> None:
     """Persist report to DB and index via LlamaIndex for RAG (Layer 4 long-term memory)."""
     assert _session_factory is not None
+    structured = {"library_findings": findings or []}
     async with _session_factory() as session:
         stmt = (
             pg_insert(Report)
-            .values(id=str(uuid.uuid4()), run_id=run_id, content=content)
-            .on_conflict_do_update(index_elements=["run_id"], set_={"content": content})
+            .values(
+                id=str(uuid.uuid4()),
+                run_id=run_id,
+                content=content,
+                structured=structured,
+            )
+            .on_conflict_do_update(
+                index_elements=["run_id"],
+                set_={"content": content, "structured": structured},
+            )
         )
         await session.execute(stmt)
         await session.commit()
@@ -209,20 +227,20 @@ async def _save_and_embed_report(run_id: str, content: str) -> None:
 
     title = (run.title or run.query) if run else run_id
     query = run.query if run else ""
-    await rag.embed_and_store(run_id, content, title, query)
+    await rag.embed_and_store(run_id, content, title, query, findings=findings)
 
 
 # ---------------------------------------------------------------------------
 # Core SSE stream generator (shared by /research and /runs/{id}/resume)
 # ---------------------------------------------------------------------------
 
-def _evt(data: dict) -> dict[str, str]:
+def _evt(data: dict[str, object]) -> dict[str, str]:
     return {"data": json.dumps({**data, "ts": time.time()})}
 
 
 async def _stream_graph(
     run_id: str,
-    input_: dict | Command,  # type: ignore[type-arg]
+    input_: dict[str, object] | Command,
     debate_mode: bool = False,
     debate_rounds: int = DEFAULT_DEBATE_ROUNDS,
 ) -> AsyncGenerator[dict[str, str], None]:
@@ -236,7 +254,7 @@ async def _stream_graph(
       debate_token        {type, agent, content}      (debate mode only, per LLM token)
       debate_turn         {type, agent, model, round, content}  (debate mode only)
       judging             {type}                      (debate mode only)
-      debate_verdict      {type, winner, rows: [{category, assessment, winner}], model}  (debate mode only)
+      debate_verdict      {type, winner, rows, model}  (debate mode only)
       gap_planning        {type}                      (debate mode only)
       gap_plan            {type, subtasks: [...]}     (debate mode only)
       synthesizing        {type}
@@ -248,6 +266,7 @@ async def _stream_graph(
     assert _graph is not None
     config = {"configurable": {"thread_id": run_id}}
     start_time = time.time()
+    findings_for_index: list[dict[str, object]] = []
 
     yield _evt({"type": "started", "run_id": run_id})
 
@@ -285,7 +304,8 @@ async def _stream_graph(
                     yield _evt({"type": "plan", "subtasks": subtasks, "title": title})
 
                 elif node_name in ("subagent", "gap_subagent"):
-                    findings: list[dict] = node_output.get("findings", [])  # type: ignore[union-attr]
+                    findings: list[dict[str, object]] = node_output.get("findings", [])  # type: ignore[union-attr]
+                    findings_for_index.extend(findings)
                     processed: list[str] = node_output.get("processed_subtasks", [])
                     fallback = findings[0]["subtask"] if findings else ""
                     question = processed[0] if processed else fallback
@@ -344,7 +364,9 @@ async def _stream_graph(
                     report: str = node_output.get("report", "")  # type: ignore[union-attr]
                     if report:
                         # Persist to DB + embed in background — don't block the SSE stream
-                        asyncio.create_task(_save_and_embed_report(run_id, report))
+                        asyncio.create_task(
+                            _save_and_embed_report(run_id, report, list(findings_for_index))
+                        )
                     yield _evt({"type": "report", "content": report, "run_id": run_id})
 
         # After the loop: detect interrupt (clarification needed) vs normal completion.
@@ -588,7 +610,7 @@ async def delete_run(run_id: str, request: Request) -> dict[str, object]:
 
 @app.post("/runs/{run_id}/eval")
 async def run_eval(
-    run_id: str, request: Request, strict: bool = False, model: str | None = None
+    run_id: str, request: Request, strict: bool = True, model: str | None = None
 ) -> dict[str, object]:
     """Run the eval harness (eval/harness.py) against a completed run and persist the result."""
     assert _session_factory is not None
@@ -709,7 +731,13 @@ async def community_eval_trend(limit: int = 200) -> list[dict[str, object]]:
             "total_citations": total_citations,
             "unfaithful_count": unfaithful_count,
         }
-        for generated_at, total_findings, ungrounded_count, total_citations, unfaithful_count in reversed(rows)
+        for (
+            generated_at,
+            total_findings,
+            ungrounded_count,
+            total_citations,
+            unfaithful_count,
+        ) in reversed(rows)
     ]
 
 
@@ -737,7 +765,7 @@ async def list_eval_reports(
 
 @app.get("/eval/reports/{report_id}")
 async def get_eval_report(report_id: str, request: Request) -> dict[str, object]:
-    """Full persisted eval report, including grounding/faithfulness detail, for drill-down (public)."""
+    """Full persisted eval report, including grounding/faithfulness detail."""
     assert _session_factory is not None
 
     async with _session_factory() as session:
@@ -852,7 +880,11 @@ async def library_chat(body: LibraryChatRequest, request: Request) -> EventSourc
             yield _evt({
                 "type": "chunks_retrieved",
                 "chunks": [
-                    {"content": str(c["content"]), "title": str(c["title"]), "run_id": str(c["run_id"])}
+                    {
+                        "content": str(c["content"]),
+                        "title": str(c["title"]),
+                        "run_id": str(c["run_id"]),
+                    }
                     for c in chunks
                 ],
             })
@@ -915,22 +947,32 @@ async def library_eval_judge(body: RagJudgeRequest) -> dict[str, object]:
     import asyncio as _asyncio
 
     from engine.models import estimate_cost_usd as _cost
+    from eval.rag_answer_relevance import run_answer_relevance
     from eval.rag_context_precision import run_context_precision
+    from eval.rag_context_sufficiency import run_context_sufficiency
     from eval.rag_faithfulness import run_rag_faithfulness
 
     (precision_verdicts, context_precision, precision_usage), \
-    (faithfulness_verdicts, answer_faithfulness, faithfulness_usage) = await _asyncio.gather(
+    (sufficiency_verdict, context_sufficiency, sufficiency_usage), \
+    (faithfulness_verdicts, answer_faithfulness, faithfulness_usage), \
+    (relevance_verdict, answer_relevance, relevance_usage) = await _asyncio.gather(
         run_context_precision(body.question, body.chunks, body.eval_model),
+        run_context_sufficiency(body.question, body.chunks, body.eval_model),
         run_rag_faithfulness(body.answer, body.chunks, body.eval_model),
+        run_answer_relevance(body.question, body.answer, body.chunks, body.eval_model),
     )
-    all_usage = [*precision_usage, *faithfulness_usage]
+    all_usage = [*precision_usage, *sufficiency_usage, *faithfulness_usage, *relevance_usage]
     return {
         "question": body.question,
         "chunks_retrieved": len(body.chunks),
         "chunk_verdicts": [v.model_dump() for v in precision_verdicts],
         "context_precision": context_precision,
+        "context_sufficiency": context_sufficiency,
+        "context_sufficiency_verdict": sufficiency_verdict.model_dump(),
         "claim_verdicts": [v.model_dump() for v in faithfulness_verdicts],
         "answer_faithfulness": answer_faithfulness,
+        "answer_relevance": answer_relevance,
+        "answer_relevance_verdict": relevance_verdict.model_dump(),
         "eval_cost_usd": _cost(all_usage),
     }
 
@@ -943,33 +985,43 @@ async def library_reindex(request: Request) -> dict[str, object]:
     existing chunks before re-indexing to avoid duplicates.
     """
     assert _session_factory is not None
-    assert _graph is not None
     client_id = _client_id(request)
 
     async with _session_factory() as session:
         stmt = (
-            select(ResearchRun.id, ResearchRun.title, ResearchRun.query)
+            select(
+                ResearchRun.id,
+                ResearchRun.title,
+                ResearchRun.query,
+                Report.content,
+                Report.structured,
+            )
+            .join(Report, Report.run_id == ResearchRun.id)
             .where(ResearchRun.status == "done")
             .order_by(ResearchRun.started_at.desc())
         )
         if client_id is not None:
             stmt = stmt.where(ResearchRun.client_id == client_id)
         rows = await session.execute(stmt)
-        runs = [(str(r.id), r.title or r.query, r.query) for r in rows]
+        runs: list[tuple[str, str, str, str, list[dict[str, object]]]] = []
+        for r in rows:
+            structured = r.structured or {}
+            stored_findings = structured.get("library_findings", [])
+            findings = []
+            if isinstance(stored_findings, list):
+                findings = [f for f in stored_findings if isinstance(f, dict)]
+            runs.append((str(r.id), r.title or r.query, r.query, r.content, findings))
 
     indexed = 0
     failed: list[dict[str, str]] = []
 
-    for run_id, title, query in runs:
+    for run_id, title, query, report, findings in runs:
         try:
-            config: dict = {"configurable": {"thread_id": run_id}}
-            snapshot = await _graph.aget_state(config)
-            report: str = snapshot.values.get("report", "")
             if not report:
-                failed.append({"run_id": run_id, "reason": "no report in checkpoint state"})
+                failed.append({"run_id": run_id, "reason": "no persisted report"})
                 continue
             await rag.delete_chunks(run_id)
-            await rag.embed_and_store(run_id, report, title, query)
+            await rag.embed_and_store(run_id, report, title, query, findings=findings)
             indexed += 1
         except Exception as exc:
             failed.append({"run_id": run_id, "reason": str(exc)})

@@ -46,6 +46,22 @@ class UncitedSentence(BaseModel):
     section: str = ""
 
 
+class CitationCoverageIssue(BaseModel):
+    """An uncited factual report sentence that should have had a citation."""
+
+    sentence: str
+    section: str = ""
+    reasoning: str
+
+
+class CitationCoverageResult(BaseModel):
+    """Citation coverage: are factual report claims cited?"""
+
+    coverage_score: float
+    cited_sentence_count: int
+    uncited_factual_claims: list[CitationCoverageIssue]
+
+
 class SubtopicCoverage(BaseModel):
     """Whether one expected subtopic is addressed by the report."""
 
@@ -87,6 +103,20 @@ class RagAnswerClaimVerdict(BaseModel):
     reasoning: str
 
 
+class RagContextSufficiencyVerdict(BaseModel):
+    """LLM-judge verdict for whether retrieved RAG context is enough to answer."""
+
+    sufficient: bool
+    reasoning: str
+
+
+class RagAnswerRelevanceVerdict(BaseModel):
+    """LLM-judge verdict for whether a RAG answer responds to the question."""
+
+    score: int  # 1-5
+    reasoning: str
+
+
 class RagEvalReport(BaseModel):
     """Aggregate RAG eval result for one question against the Research Library."""
 
@@ -100,11 +130,15 @@ class RagEvalReport(BaseModel):
     chunks_retrieved: int
     chunk_verdicts: list[RagChunkVerdict]
     context_precision: float  # relevant chunks / total chunks (0–1)
+    context_sufficiency: float  # 1.0 if chunks are sufficient to answer, else 0.0
+    context_sufficiency_verdict: RagContextSufficiencyVerdict
 
     # Generation
     answer: str
     claim_verdicts: list[RagAnswerClaimVerdict]
     answer_faithfulness: float  # supported claims / total claims (0–1)
+    answer_relevance: float  # answer relevance verdict normalized to 0–1
+    answer_relevance_verdict: RagAnswerRelevanceVerdict
 
     eval_model: str = ""
     eval_input_tokens: int = 0
@@ -124,22 +158,26 @@ class RagEvalReport(BaseModel):
             "",
             f"Context Precision: {self.context_precision:.0%} "
             f"({n_relevant}/{len(self.chunk_verdicts)} chunks relevant)",
+            f"Context Sufficiency: {self.context_sufficiency:.0%} — "
+            f"{self.context_sufficiency_verdict.reasoning}",
         ]
-        for v in self.chunk_verdicts:
-            mark = "+" if v.relevant else "-"
-            lines.append(f"  [{mark}] [{v.title}] {v.preview[:80]}…")
-            if not v.relevant:
-                lines.append(f"       {v.reasoning}")
+        for chunk_verdict in self.chunk_verdicts:
+            mark = "+" if chunk_verdict.relevant else "-"
+            lines.append(f"  [{mark}] [{chunk_verdict.title}] {chunk_verdict.preview[:80]}…")
+            if not chunk_verdict.relevant:
+                lines.append(f"       {chunk_verdict.reasoning}")
         lines += [
             "",
             f"Answer Faithfulness: {self.answer_faithfulness:.0%} "
             f"({n_supported}/{len(self.claim_verdicts)} claims supported)",
+            f"Answer Relevance: {self.answer_relevance:.0%} — "
+            f"{self.answer_relevance_verdict.reasoning}",
         ]
-        for v in self.claim_verdicts:
-            mark = "+" if v.supported else "-"
-            lines.append(f"  [{mark}] {v.claim}")
-            if not v.supported:
-                lines.append(f"       {v.reasoning}")
+        for claim_verdict in self.claim_verdicts:
+            mark = "+" if claim_verdict.supported else "-"
+            lines.append(f"  [{mark}] {claim_verdict.claim}")
+            if not claim_verdict.supported:
+                lines.append(f"       {claim_verdict.reasoning}")
         lines += [
             "",
             f"Eval cost: ${self.eval_cost_usd:.4f} ({self.eval_model}, "
@@ -158,6 +196,7 @@ class EvalReport(BaseModel):
     grounding_results: list[GroundingResult]
     faithfulness_results: list[FaithfulnessVerdict]
     uncited_sentences: list[UncitedSentence]
+    citation_coverage: CitationCoverageResult
     completeness: CompletenessResult
     relevance: RelevanceResult
 
@@ -207,6 +246,8 @@ class EvalReport(BaseModel):
         lines += [
             "",
             f"Uncited sentences: {len(self.uncited_sentences)} (informational)",
+            f"Citation coverage: {self.citation_coverage.coverage_score:.0%} "
+            f"({len(self.citation_coverage.uncited_factual_claims)} uncited factual claims)",
             "",
             f"Completeness: {self.completeness.recall_score:.0%} "
             f"({sum(1 for s in self.completeness.subtopics if s.covered)}/"

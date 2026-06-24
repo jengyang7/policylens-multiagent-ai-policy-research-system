@@ -79,7 +79,37 @@ def _vector_store() -> PGVectorStore:
     )
 
 
-async def embed_and_store(run_id: str, content: str, title: str, query: str) -> None:
+def _format_findings_for_index(findings: list[dict[str, object]] | None) -> str:
+    if not findings:
+        return ""
+
+    lines = ["\n\n## Evidence-Backed Findings"]
+    for finding in findings:
+        subtask = str(finding.get("subtask", "")).strip()
+        claim = str(finding.get("claim", "")).strip()
+        evidence = str(finding.get("evidence_span", "")).strip()
+        citation_url = str(finding.get("citation_url", "")).strip()
+        if not claim:
+            continue
+
+        if subtask:
+            lines.append(f"\n### {subtask}")
+        lines.append(f"- Claim: {claim}")
+        if evidence:
+            lines.append(f"  Evidence: {evidence[:800]}")
+        if citation_url:
+            lines.append(f"  Source: {citation_url}")
+
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+async def embed_and_store(
+    run_id: str,
+    content: str,
+    title: str,
+    query: str,
+    findings: list[dict[str, object]] | None = None,
+) -> None:
     """Section-aware ingest: chunk by markdown headings, embed, store (Layer 4).
 
     Pipeline:
@@ -88,12 +118,18 @@ async def embed_and_store(run_id: str, content: str, title: str, query: str) -> 
       OpenAIEmbedding     — embeds each final node
       PGVectorStore       — stores vectors with run_id/title/query metadata
 
+    When raw extraction findings are available, they are indexed after the
+    report body as evidence-backed retrieval context. This gives library chat
+    access to precise claim/evidence/source text while still answering only
+    from saved research artifacts.
+
     Existing reports ingested with the old sentence-only splitter remain in
     the table unchanged; only new ingests use this pipeline.
     """
     body = re.split(r"\n##\s+References\b", content, maxsplit=1)[0]
+    index_text = body + _format_findings_for_index(findings)
     doc = Document(
-        text=body,
+        text=index_text,
         doc_id=run_id,
         metadata={"run_id": run_id, "title": title, "query": query},
         excluded_embed_metadata_keys=_EXCLUDE_FROM_EMBED,
@@ -280,11 +316,14 @@ async def answer_with_context(
         ChatMessage(
             role=MessageRole.SYSTEM,
             content=(
-                "You are a concise research assistant with access to the user's past research reports.\n\n"
+                "You are a concise research assistant with access to the user's past "
+                "research reports.\n\n"
                 "Rules:\n"
                 "- Answer using ONLY the provided context — never invent facts.\n"
-                "- Be brief: 2–4 sentences for simple questions, one short paragraph for complex ones.\n"
-                "  Only use a table when the question explicitly asks for comparison or structure.\n"
+                "- Be brief: 2–4 sentences for simple questions, one short paragraph "
+                "for complex ones.\n"
+                "  Only use a table when the question explicitly asks for comparison "
+                "or structure.\n"
                 "- **Bold** key terms, conclusions, and important caveats inline.\n"
                 "- Cite by report title inline when relevant: 'According to the report on X…'.\n"
                 "- Do NOT offer to reformat, summarize differently, or convert your answer.\n"

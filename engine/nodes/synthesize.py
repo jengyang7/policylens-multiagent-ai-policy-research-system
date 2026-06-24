@@ -104,23 +104,26 @@ def _format_findings(findings: list[SubtaskFinding]) -> str:
 
 
 def _source_list(findings: list[SubtaskFinding]) -> str:
-    """Numbered deduplicated source list appended to the compact summary.
+    """Numbered raw finding list appended to the compact summary.
 
     The compact summary is prose (no [i] numbering), so the synthesizer has no
     explicit anchor to assign [i] markers to. Appending a pre-numbered list of
-    unique source URLs gives it a clear [i] → URL mapping to cite from — the
+    raw findings gives it a clear [i] → finding mapping to cite from — the
     same list verify_citations uses as a fallback when rebuilding References.
     """
-    seen: list[str] = []
-    for f in findings:
-        url = f.get("citation_url", "")
-        if url and url not in seen:
-            seen.append(url)
-    if not seen:
+    if not findings:
         return ""
-    lines = ["\n\nSource URLs — use [i] from this list for your inline citations and References section:"]
-    for i, url in enumerate(seen, 1):
-        lines.append(f"[{i}] [{url}]({url})")
+    lines = [
+        "\n\nNumbered findings — use [i] from this list for inline citations "
+        "and the References section:"
+    ]
+    for i, f in enumerate(findings, 1):
+        lines.append(
+            f"[{i}] Subtask: {f['subtask']}\n"
+            f"    Claim: {f['claim']}\n"
+            f"    Evidence: {f['evidence_span']}\n"
+            f"    Source: {f['citation_url']}"
+        )
     return "\n".join(lines)
 
 
@@ -143,7 +146,7 @@ def synthesize(state: ResearchState) -> dict[str, object]:
     model = state.get("lead_model", LEAD_MODEL)
     llm = make_chat_model(model, temperature=0)
     chain = _PROMPT | llm
-    result: BaseMessage = chain.invoke(  # type: ignore[assignment]
+    result: BaseMessage = chain.invoke(
         {
             "query": state["query"],
             "findings_text": findings_text,

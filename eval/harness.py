@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 from engine.models import LEAD_MODEL, estimate_cost_usd
 from engine.state import TokenUsage
+from eval.citation_coverage import run_citation_coverage_check
 from eval.completeness import run_completeness_check
 from eval.faithfulness import run_faithfulness_checks
 from eval.grounding import run_grounding_checks
@@ -22,21 +23,26 @@ from eval.schema import EvalReport
 
 
 async def evaluate_run(
-    run_id: str, lead_model: str = LEAD_MODEL, strict: bool = False
+    run_id: str, lead_model: str = LEAD_MODEL, strict: bool = True
 ) -> EvalReport:
     """Load `run_id`, run grounding + faithfulness + completeness + relevance
     checks, and build an EvalReport.
 
-    `passed` requires zero ungrounded findings (the spec's literal "0
-    ungrounded claims" criterion). If `strict` is True, `passed` additionally
-    requires zero unfaithful citations. Completeness and relevance are scored
-    but do not affect `passed`.
+    `passed` requires zero ungrounded findings and, by default, zero unfaithful
+    citations. Set `strict=False` only for exploratory runs where report
+    faithfulness should be scored but not fail the run. Completeness and
+    citation coverage. Set `strict=False` only for exploratory runs where
+    report-level quality issues should be scored but not fail the run.
+    Completeness and relevance are scored but do not affect `passed`.
     """
     run_data = await load_run(run_id)
 
     grounding_results = await run_grounding_checks(run_data.findings)
     faithfulness_results, uncited_sentences, faithfulness_usage = await run_faithfulness_checks(
         run_data.report, run_data.findings, lead_model
+    )
+    citation_coverage, citation_coverage_usage = await run_citation_coverage_check(
+        run_data.report, lead_model
     )
     completeness_result, completeness_usage = await run_completeness_check(
         run_data.query, run_data.report, lead_model
@@ -47,17 +53,24 @@ async def evaluate_run(
 
     ungrounded_count = sum(1 for g in grounding_results if not g.grounded)
     unfaithful_count = sum(1 for f in faithfulness_results if not f.faithful)
+    uncited_factual_count = len(citation_coverage.uncited_factual_claims)
 
     failure_reasons = []
     if ungrounded_count:
         failure_reasons.append(f"{ungrounded_count} ungrounded claim(s)")
     if strict and unfaithful_count:
         failure_reasons.append(f"{unfaithful_count} unfaithful citation(s)")
+    if strict and uncited_factual_count:
+        failure_reasons.append(f"{uncited_factual_count} uncited factual claim(s)")
 
-    passed = ungrounded_count == 0 and (not strict or unfaithful_count == 0)
+    passed = (
+        ungrounded_count == 0
+        and (not strict or (unfaithful_count == 0 and uncited_factual_count == 0))
+    )
 
     eval_token_usage: list[TokenUsage] = [
         *faithfulness_usage,
+        *citation_coverage_usage,
         *completeness_usage,
         *([relevance_usage] if relevance_usage else []),
     ]
@@ -69,6 +82,7 @@ async def evaluate_run(
         grounding_results=grounding_results,
         faithfulness_results=faithfulness_results,
         uncited_sentences=uncited_sentences,
+        citation_coverage=citation_coverage,
         completeness=completeness_result,
         relevance=relevance_result,
         total_findings=len(run_data.findings),

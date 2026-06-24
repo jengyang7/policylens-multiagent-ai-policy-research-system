@@ -6,7 +6,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+from engine.nodes.verify_citations import verify_citations
 from engine.state import SubtaskFinding, TokenUsage
+from eval.citation_coverage import _CitationNeedVerdict, run_citation_coverage_check
 from eval.completeness import (
     _CoverageList,
     _SubtopicList,
@@ -18,6 +20,9 @@ from eval.faithfulness import _JudgeVerdict, run_faithfulness_checks
 from eval.grounding import check_grounding, run_grounding_checks
 from eval.harness import evaluate_run
 from eval.loader import EvalRunData
+from eval.rag_answer_relevance import _AnswerRelevanceVerdict, run_answer_relevance
+from eval.rag_context_sufficiency import run_context_sufficiency
+from eval.rag_faithfulness import _ClaimList, run_rag_faithfulness
 from eval.relevance import _RelevanceVerdict, run_relevance_check
 from eval.report_parsing import (
     extract_citation_indices,
@@ -27,9 +32,11 @@ from eval.report_parsing import (
     strip_citation_markers,
 )
 from eval.schema import (
+    CitationCoverageResult,
     CompletenessResult,
     FaithfulnessVerdict,
     GroundingResult,
+    RagAnswerRelevanceVerdict,
     RelevanceResult,
     SubtopicCoverage,
 )
@@ -249,6 +256,45 @@ async def test_faithfulness_no_finding_for_citation_url() -> None:
     assert "no finding" in verdicts[0].reasoning.lower()
 
 
+async def test_verify_citations_removes_unfaithful_sentence(monkeypatch) -> None:
+    report = (
+        "Supported claim [1]. Unsupported claim [1].\n\n"
+        "## References\n\n[1] [Source A](https://a.com)\n"
+    )
+
+    async def fake_faithfulness(report, findings, lead_model):
+        return (
+            [
+                FaithfulnessVerdict(
+                    citation_index=1,
+                    report_sentence="Supported claim",
+                    matched_finding_claims=["c"],
+                    faithful=True,
+                    confidence=1.0,
+                    reasoning="ok",
+                ),
+                FaithfulnessVerdict(
+                    citation_index=1,
+                    report_sentence="Unsupported claim",
+                    matched_finding_claims=["c"],
+                    faithful=False,
+                    confidence=1.0,
+                    reasoning="unsupported",
+                ),
+            ],
+            [],
+            [],
+        )
+
+    monkeypatch.setattr("engine.nodes.verify_citations.run_faithfulness_checks", fake_faithfulness)
+    result = await verify_citations(  # type: ignore[typeddict-item]
+        {"report": report, "findings": [_finding("evidence", "https://a.com")]}
+    )
+    verified_report = str(result["report"])
+    assert "Supported claim [1]." in verified_report
+    assert "Unsupported claim" not in verified_report
+
+
 # ---------------------------------------------------------------------------
 # completeness (LLM judge mocked)
 # ---------------------------------------------------------------------------
@@ -340,6 +386,91 @@ async def test_run_relevance_check(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# citation coverage (LLM judge mocked)
+# ---------------------------------------------------------------------------
+
+async def test_run_citation_coverage_flags_uncited_factual_claim(monkeypatch) -> None:
+    _mock_structured_chain(
+        monkeypatch,
+        "eval.citation_coverage",
+        "_COVERAGE_PROMPT",
+        _CitationNeedVerdict(citation_required=True, reasoning="specific factual claim"),
+    )
+
+    result, usage = await run_citation_coverage_check(_SAMPLE_REPORT)
+
+    assert result.cited_sentence_count == 2
+    assert len(result.uncited_factual_claims) == 1
+    assert result.coverage_score == 2 / 3
+    assert len(usage) == 1
+
+
+async def test_run_citation_coverage_no_uncited_sentences_short_circuits() -> None:
+    report = "Claim one [1]. Claim two [2].\n\n## References\n\n[1] [A](https://a.com)"
+
+    result, usage = await run_citation_coverage_check(report)
+
+    assert result.coverage_score == 1.0
+    assert result.cited_sentence_count == 2
+    assert result.uncited_factual_claims == []
+    assert usage == []
+
+
+# ---------------------------------------------------------------------------
+# RAG eval
+# ---------------------------------------------------------------------------
+
+async def test_rag_answer_relevance_scores_answer(monkeypatch) -> None:
+    _mock_structured_chain(
+        monkeypatch,
+        "eval.rag_answer_relevance",
+        "_ANSWER_RELEVANCE_PROMPT",
+        _AnswerRelevanceVerdict(score=4, reasoning="directly answers most of it"),
+    )
+
+    verdict, score, usage = await run_answer_relevance(
+        "What changed?",
+        "The main change was X.",
+        chunks=[{"content": "X changed.", "title": "Report"}],
+    )
+
+    assert verdict == RagAnswerRelevanceVerdict(
+        score=4,
+        reasoning="directly answers most of it",
+    )
+    assert score == 0.8
+    assert len(usage) == 1
+
+async def test_rag_faithfulness_no_chunks_marks_claims_unsupported(monkeypatch) -> None:
+    _mock_structured_chain(
+        monkeypatch,
+        "eval.rag_faithfulness",
+        "_EXTRACT_PROMPT",
+        _ClaimList(claims=["The market grew 20 percent."]),
+    )
+
+    verdicts, score, usage = await run_rag_faithfulness(
+        "The market grew 20 percent.",
+        chunks=[],
+    )
+
+    assert score == 0.0
+    assert len(verdicts) == 1
+    assert verdicts[0].supported is False
+    assert "No source chunks" in verdicts[0].reasoning
+    assert len(usage) == 1
+
+
+async def test_rag_context_sufficiency_no_chunks_short_circuits() -> None:
+    verdict, score, usage = await run_context_sufficiency("What changed?", chunks=[])
+
+    assert score == 0.0
+    assert verdict.sufficient is False
+    assert "No source chunks" in verdict.reasoning
+    assert usage == []
+
+
+# ---------------------------------------------------------------------------
 # harness end-to-end (loader + checks mocked)
 # ---------------------------------------------------------------------------
 
@@ -358,6 +489,29 @@ def _fake_relevance_check():
     async def fake(query: str, report: str, lead_model: str):
         return RelevanceResult(score=5, reasoning="on-topic"), None
     return fake
+
+
+def _fake_citation_coverage_check(
+    uncited_factual_claims: int = 0,
+):
+    async def fake(report: str, lead_model: str):
+        return (
+            CitationCoverageResult(
+                coverage_score=1.0 if uncited_factual_claims == 0 else 0.5,
+                cited_sentence_count=1,
+                uncited_factual_claims=[
+                    {
+                        "sentence": f"uncited claim {i}",
+                        "section": "Overview",
+                        "reasoning": "needs a citation",
+                    }
+                    for i in range(uncited_factual_claims)
+                ],
+            ),
+            [],
+        )
+    return fake
+
 
 async def test_evaluate_run_passes_when_all_grounded_and_faithful(monkeypatch) -> None:
     fake_run_data = EvalRunData(run_id="r1", query="q", status="done", report="report", findings=[])
@@ -386,6 +540,7 @@ async def test_evaluate_run_passes_when_all_grounded_and_faithful(monkeypatch) -
     monkeypatch.setattr("eval.harness.load_run", fake_load_run)
     monkeypatch.setattr("eval.harness.run_grounding_checks", fake_grounding)
     monkeypatch.setattr("eval.harness.run_faithfulness_checks", fake_faithfulness)
+    monkeypatch.setattr("eval.harness.run_citation_coverage_check", _fake_citation_coverage_check())
     monkeypatch.setattr("eval.harness.run_completeness_check", _fake_completeness_check())
     monkeypatch.setattr("eval.harness.run_relevance_check", _fake_relevance_check())
 
@@ -418,6 +573,7 @@ async def test_evaluate_run_fails_on_ungrounded(monkeypatch) -> None:
     monkeypatch.setattr("eval.harness.load_run", fake_load_run)
     monkeypatch.setattr("eval.harness.run_grounding_checks", fake_grounding)
     monkeypatch.setattr("eval.harness.run_faithfulness_checks", fake_faithfulness)
+    monkeypatch.setattr("eval.harness.run_citation_coverage_check", _fake_citation_coverage_check())
     monkeypatch.setattr("eval.harness.run_completeness_check", _fake_completeness_check())
     monkeypatch.setattr("eval.harness.run_relevance_check", _fake_relevance_check())
 
@@ -449,6 +605,7 @@ async def test_evaluate_run_strict_mode_fails_on_unfaithful(monkeypatch) -> None
     monkeypatch.setattr("eval.harness.load_run", fake_load_run)
     monkeypatch.setattr("eval.harness.run_grounding_checks", fake_grounding)
     monkeypatch.setattr("eval.harness.run_faithfulness_checks", fake_faithfulness)
+    monkeypatch.setattr("eval.harness.run_citation_coverage_check", _fake_citation_coverage_check())
     monkeypatch.setattr("eval.harness.run_completeness_check", _fake_completeness_check())
     monkeypatch.setattr("eval.harness.run_relevance_check", _fake_relevance_check())
 
@@ -458,3 +615,33 @@ async def test_evaluate_run_strict_mode_fails_on_unfaithful(monkeypatch) -> None
     strict = await evaluate_run("r1", strict=True)
     assert not strict.passed
     assert "unfaithful" in strict.failure_reasons[0]
+
+
+async def test_evaluate_run_strict_mode_fails_on_uncited_factual_claim(monkeypatch) -> None:
+    fake_run_data = EvalRunData(run_id="r1", query="q", status="done", report="report", findings=[])
+
+    async def fake_load_run(run_id: str, require_done: bool = True) -> EvalRunData:
+        return fake_run_data
+
+    async def fake_grounding(findings, fetch_fn=None) -> list[GroundingResult]:
+        return []
+
+    async def fake_faithfulness(report, findings, lead_model):
+        return [], [], []
+
+    monkeypatch.setattr("eval.harness.load_run", fake_load_run)
+    monkeypatch.setattr("eval.harness.run_grounding_checks", fake_grounding)
+    monkeypatch.setattr("eval.harness.run_faithfulness_checks", fake_faithfulness)
+    monkeypatch.setattr(
+        "eval.harness.run_citation_coverage_check",
+        _fake_citation_coverage_check(uncited_factual_claims=1),
+    )
+    monkeypatch.setattr("eval.harness.run_completeness_check", _fake_completeness_check())
+    monkeypatch.setattr("eval.harness.run_relevance_check", _fake_relevance_check())
+
+    lenient = await evaluate_run("r1", strict=False)
+    assert lenient.passed
+
+    strict = await evaluate_run("r1", strict=True)
+    assert not strict.passed
+    assert "uncited factual" in strict.failure_reasons[0]

@@ -21,10 +21,17 @@ from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel
 
 from engine.models import LEAD_MODEL, make_chat_model, structured_output_kwargs
-from engine.state import DebateTurn, DebateVerdict, ResearchState
+from engine.state import (
+    DebateTurn,
+    DebateVerdict,
+    ResearchState,
+)
+from engine.state import (
+    VerdictRow as StateVerdictRow,
+)
 from engine.usage import usage_from_message
 
-MAX_GAP_QUESTIONS = 3
+MAX_GAP_QUESTIONS = 5
 
 # Display names for the two debate sides — the underlying `agent` field stays
 # "advocate" | "skeptic" (model selection, SSE routing), but everything the
@@ -203,9 +210,16 @@ def judge_debate(state: ResearchState) -> dict[str, object]:
     usage = usage_from_message(raw["raw"], "judge_debate", model)
     # A parsing failure (model replied without the structured tool call) is rare
     # but not fatal — fall back to an unscored draw rather than crashing the run.
-    rows = [row.model_dump() for row in result.rows] if result else []
+    rows: list[StateVerdictRow] = [
+        StateVerdictRow(
+            category=row.category,
+            assessment=row.assessment,
+            winner=row.winner,
+        )
+        for row in result.rows
+    ] if result else []
     winner = result.winner if result else "draw"
-    verdict = DebateVerdict(rows=rows, winner=winner, model=model)  # type: ignore[arg-type]
+    verdict = DebateVerdict(rows=rows, winner=winner, model=model)
     return {"debate_verdict": verdict, "token_usage": [usage] if usage else []}
 
 
@@ -238,11 +252,16 @@ _GAP_PROMPT = ChatPromptTemplate.from_messages([
         "20 words.\n"
         "- Do NOT re-ask what the summary already answers, and do not restate "
         "debate rhetoric — only genuinely missing evidence qualifies.\n"
+        "- Prioritize empty original subtasks when they are central to the user's "
+        "question, especially missing comparison legs (for example, one company "
+        "in a 'A vs B' query).\n"
         "- If the debate surfaced no material gaps, return an empty list.",
     ),
     (
         "human",
         "Research query: {query}\n\nResearch summary:\n{summary}\n\n"
+        "Original planned subtasks:\n{original_subtasks}\n\n"
+        "Original subtasks with zero findings:\n{empty_subtasks}\n\n"
         "Debate transcript:\n{transcript}",
     ),
 ])
@@ -255,9 +274,14 @@ def plan_gap_research(state: ResearchState) -> dict[str, object]:
     chain = _GAP_PROMPT | llm.with_structured_output(
         GapResearchPlan, include_raw=True, **structured_output_kwargs(model)
     )
+    findings = state.get("findings", [])
+    answered_subtasks = {f["subtask"] for f in findings}
+    empty_subtasks = [q for q in state.get("subtasks", []) if q not in answered_subtasks]
     raw = chain.invoke({
         "query": state["query"],
         "summary": state.get("summary", ""),
+        "original_subtasks": "\n".join(f"- {q}" for q in state.get("subtasks", [])),
+        "empty_subtasks": "\n".join(f"- {q}" for q in empty_subtasks) or "(none)",
         "transcript": format_transcript(state.get("debate_turns", [])),
     })
     assert isinstance(raw, dict)  # include_raw=True returns {"raw", "parsed", "parsing_error"}

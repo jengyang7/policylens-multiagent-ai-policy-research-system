@@ -144,7 +144,7 @@ def test_synthesize_uses_summary_over_raw_findings(monkeypatch: pytest.MonkeyPat
     assert captured.get("findings_text") == "pre-compacted summary text"
 
 
-async def test_verify_citations_strips_unfaithful_citations(
+async def test_verify_citations_removes_unfaithful_sentences(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import engine.nodes.verify_citations as verify_mod
@@ -199,11 +199,11 @@ async def test_verify_citations_strips_unfaithful_citations(
     result = await verify_mod.verify_citations(state)
     report = str(result["report"])
     assert "Faithful claim [1]." in report
-    assert "Unsupported synthesis." in report
     assert "Unsupported synthesis [2]" not in report
+    assert "Unsupported synthesis." not in report
     assert result["findings"] == []
     # References section is rebuilt to match what's still cited: [1] kept,
-    # [2] dropped as an orphan since its citation was stripped from the body
+    # [2] dropped because the unsupported sentence was removed from the body.
     assert "[1] [A](https://a.com)" in report
     assert "[2] [B](https://b.com)" not in report
 

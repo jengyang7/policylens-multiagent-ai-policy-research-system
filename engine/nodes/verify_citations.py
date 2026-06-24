@@ -3,10 +3,9 @@
 Re-runs the same per-sentence faithfulness judge used by the eval harness
 (eval.faithfulness.run_faithfulness_checks) against the freshly synthesized
 report. Any [i]-cited sentence the judge can't verify against the Finding(s)
-behind reference [i] has its citation marker(s) programmatically stripped —
-turning a falsely-attributed claim into an uncited analytical/synthesis
-sentence (which the eval harness treats as informational, not penalized)
-instead of leaving a misleading citation in the published report.
+behind reference [i] is removed from the published report. Keeping the sentence
+but stripping its citation would hide an unsupported factual claim from the
+eval harness as "uncited" prose.
 
 Also rebuilds the ## References section to exactly match the [i] markers
 still present in the body afterward — the synthesizer's own References list
@@ -56,18 +55,16 @@ def _sentence_pattern(sentence: str) -> re.Pattern[str]:
     return re.compile("".join(r"\s+" if p.isspace() else re.escape(p) for p in parts))
 
 
-def _strip_citations(body: str, sentence: str, start: int) -> tuple[str, int]:
-    """Remove all [i] markers from `sentence`'s occurrence in `body` (search from `start`).
+def _remove_sentence(body: str, sentence: str, start: int) -> tuple[str, int]:
+    """Remove `sentence`'s occurrence in `body` (search from `start`).
 
     Returns (new_body, new_search_offset). No-op if the sentence can't be found.
     """
     match = _sentence_pattern(sentence).search(body, start)
     if not match:
         return body, start
-    cleaned = _CITATION_MARKER_RE.sub("", match.group(0))
-    cleaned = _DANGLING_SPACE_RE.sub(lambda m: "" if m.group().strip() == "" else " ", cleaned)
-    new_body = body[: match.start()] + cleaned + body[match.end() :]
-    return new_body, match.start() + len(cleaned)
+    new_body = body[: match.start()] + body[match.end() :]
+    return new_body, match.start()
 
 
 def _rebuild_references(
@@ -113,7 +110,7 @@ async def verify_citations(state: ResearchState) -> dict[str, object]:
     cursor = 0
     for sentence, verdict in zip(cited_sentences, verdicts):
         if not verdict.faithful:
-            body, cursor = _strip_citations(body, sentence, cursor)
+            body, cursor = _remove_sentence(body, sentence, cursor)
 
     body = _NON_NUMERIC_MARKER_RE.sub("", body)
     body = _DANGLING_SPACE_RE.sub(lambda m: "" if m.group().strip() == "" else " ", body)
