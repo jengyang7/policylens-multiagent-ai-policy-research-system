@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
@@ -16,8 +17,11 @@ from eval.grounding import check_grounding
 _PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        "You are a research extraction agent. Given a sub-question and web content, "
-        "extract every relevant finding. Each finding requires:\n"
+        "You are a research extraction agent for an AI Policy & Regulation Researcher. "
+        "Given a sub-question and web content, extract every relevant policy/regulatory "
+        "finding. Prioritize laws, proposed rules, regulator guidance, standards, "
+        "enforcement actions, legal obligations, affected actors, timelines, exemptions, "
+        "jurisdictional scope, and compliance implications. Each finding requires:\n"
         "- claim: a clear, factual statement directly supported by the content\n"
         "- evidence_span: a VERBATIM quote copied character-for-character from the "
         "content above — do not paraphrase, summarize, correct typos, or merge text "
@@ -82,10 +86,80 @@ _PRIVATE_MARKET_DOMAINS = [
     "reuters.com",
 ]
 
+_AI_POLICY_TERMS = (
+    "ai act",
+    "artificial intelligence act",
+    "regulation",
+    "regulatory",
+    "policy",
+    "compliance",
+    "governance",
+    "law",
+    "bill",
+    "standard",
+    "enforcement",
+    "liability",
+    "copyright",
+    "privacy",
+    "data protection",
+    "safety institute",
+    "frontier model",
+    "high-risk ai",
+)
+
+_AI_POLICY_DOMAINS = [
+    "copyright.gov",
+    "uscourts.gov",
+    "courtlistener.com",
+    "eur-lex.europa.eu",
+    "digital-strategy.ec.europa.eu",
+    "artificialintelligenceact.eu",
+    "whitehouse.gov",
+    "nist.gov",
+    "ftc.gov",
+    "congress.gov",
+    "gov.uk",
+    "ico.org.uk",
+    "imda.gov.sg",
+    "pdpc.gov.sg",
+    "mas.gov.sg",
+    "mddi.gov.sg",
+    "aiverifyfoundation.sg",
+    "asean.org",
+    "oecd.ai",
+    "iso.org",
+    "brookings.edu",
+    "iapp.org",
+]
+
+_SKIP_FINDING_DOMAINS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "youtu.be",
+}
+
+
+def _should_skip_source(url: str) -> bool:
+    """Skip sources that rarely provide stable, fetchable textual evidence.
+
+    Findings are later re-fetched by the grounding eval. Video pages can produce
+    transcript text for one fetcher/provider and only page chrome for another,
+    which creates exactly the "ungrounded YouTube evidence span" failure seen in
+    the eval report. Prefer durable text pages for policy/legal findings.
+    """
+    hostname = (urlparse(url).hostname or "").lower()
+    return hostname in _SKIP_FINDING_DOMAINS
+
 
 def _is_finance_question(question: str) -> bool:
     q = question.lower()
     return any(term in q for term in _FINANCE_TERMS)
+
+
+def _is_ai_policy_question(question: str) -> bool:
+    q = question.lower()
+    return any(term in q for term in _AI_POLICY_TERMS)
 
 
 def _search_specs(question: str) -> list[SearchSpec]:
@@ -99,6 +173,45 @@ def _search_specs(question: str) -> list[SearchSpec]:
         SearchSpec(question),
         SearchSpec(f"{question} latest 2026"),
     ]
+    if _is_ai_policy_question(question):
+        specs.extend([
+            SearchSpec(
+                f"{question} official regulator guidance law obligations effective date",
+                include_domains=_AI_POLICY_DOMAINS,
+            ),
+            SearchSpec(
+                f"{question} compliance obligations affected entities enforcement",
+                include_domains=_AI_POLICY_DOMAINS,
+            ),
+            SearchSpec(
+                f"{question} policy analysis legal update",
+                category="news",
+            ),
+        ])
+        if "singapore" in question.lower():
+            specs.extend([
+                SearchSpec(
+                    f"{question} Singapore IMDA PDPC MAS official AI governance",
+                    include_domains=[
+                        "imda.gov.sg",
+                        "pdpc.gov.sg",
+                        "mas.gov.sg",
+                        "mddi.gov.sg",
+                    ],
+                ),
+                SearchSpec(
+                    f"{question} Singapore AI Verify Foundation sandbox consultation industry",
+                    include_domains=[
+                        "aiverifyfoundation.sg",
+                        "imda.gov.sg",
+                        "mas.gov.sg",
+                    ],
+                ),
+                SearchSpec(
+                    f"{question} Singapore ASEAN OECD cross-border AI governance alignment",
+                    include_domains=["asean.org", "oecd.ai", "imda.gov.sg", "mddi.gov.sg"],
+                ),
+            ])
     if not _is_finance_question(question):
         return specs
 
@@ -162,6 +275,8 @@ def subagent(state: SubagentInput) -> dict[str, object]:
         for result in results:
             url = str(result.get("url", ""))
             if not url:
+                continue
+            if _should_skip_source(url):
                 continue
             if url in processed_urls:
                 continue

@@ -9,6 +9,7 @@ const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
 
 type Phase = 'idle' | 'querying' | 'clarifying' | 'researching' | 'done' | 'error';
 type LogType = 'start' | 'plan' | 'subtask' | 'debate' | 'synthesis' | 'report' | 'complete' | 'clarify' | 'error';
+type ResearchMode = 'single_agent' | 'multi_agent_no_compaction' | 'multi_agent_compaction' | 'multi_agent_verified';
 type LibrarySource    = { run_id: string; title: string; query: string };
 type LibraryStepType  = 'searching' | 'chunks_retrieved' | 'generating' | 'done' | 'error';
 interface LibraryStep  { id: number; type: LibraryStepType; label: string; detail?: string; ts: string; }
@@ -74,6 +75,7 @@ interface HistoryEntry {
   showReport: boolean;
   chatMessages: ChatMessage[];
   usageStats: UsageStats | null;
+  runMode?: ResearchMode;
   debateTurns?: DebateTurn[];
   // Second research round: gap questions distilled from the debate
   gapSubtasks?: SubtaskState[];
@@ -86,16 +88,20 @@ const HISTORY_KEY = 'dra_history_v1';
 const ACTIVE_ID_KEY = 'dra_active_id_v1';
 const CLIENT_ID_KEY = 'dra_client_id_v1';
 
-// Clickable starter queries on the New Research page — click to research immediately
+const RESEARCH_MODE_OPTIONS: ModelOption[] = [
+  { id: 'multi_agent_verified', label: 'L4 Citation Checked', description: 'Multi-agent + compaction + verifier' },
+  { id: 'multi_agent_compaction', label: 'L3 Compacted', description: 'Multi-agent + compaction' },
+  { id: 'multi_agent_no_compaction', label: 'L2 Multi-Agent', description: 'Parallel agents, raw synthesis' },
+  { id: 'single_agent', label: 'L1 Single Agent', description: 'Baseline: one researcher' },
+];
+
+// Clickable starter queries on the New Policy Research page — click to research immediately
 const SUGGESTED_QUERIES = [
-  'Should governments regulate frontier AI models?',
-  'Will AI replace more software engineers than it creates by 2030?',
-  // 'Can LLM-based sentiment analysis consistently outperform traditional financial indicators?',
-  // 'Should companies adopt AI agents instead of SaaS workflows?',
-  'Is open-source AI more beneficial to society than proprietary AI?',
-  'Will AGI arrive before 2030?',
-  'Is a Computer Science degree still worth it in the AI era?',
-  // 'Can solo founders build billion-dollar companies using AI?',
+  'How is Singapore regulating AI governance and model risk in 2026?',
+  'What obligations does the EU AI Act create for high-risk AI systems?',
+  'How are the US, EU, and UK regulating frontier AI models?',
+  'What AI transparency rules affect generative AI providers in 2026?',
+  'What are the main AI copyright lawsuits and policy risks?',
 ];
 
 // ---------------------------------------------------------------------------
@@ -425,7 +431,7 @@ function DebateBubble({
 }
 
 // ---------------------------------------------------------------------------
-// Sidebar (New Research + Recents history)
+// Sidebar (New Policy Research + Recents history)
 // ---------------------------------------------------------------------------
 
 function HistoryItemIcon() {
@@ -485,11 +491,13 @@ function Sidebar({
       {/* Brand */}
       <div className="px-5 py-5 border-b border-gray-200 flex items-center justify-between">
         <h1 className="text-[20px] font-extrabold text-gray-900 tracking-tight leading-tight">
-          MindClash
+          AI Policy
+          <br />
+          Researcher
           <span className="block text-[12px] font-bold text-gray-400 tracking-normal mt-2">
-            Multi-agent deep research with
+            Citation-verified regulatory
             <br />
-            debate system
+            intelligence
           </span>
      
         </h1>
@@ -504,7 +512,7 @@ function Sidebar({
         </button>
       </div>
 
-      {/* New Research */}
+      {/* New Policy Research */}
       <div className="px-3 pt-4 space-y-1.5">
         <button
           onClick={onNewResearch}
@@ -517,10 +525,10 @@ function Sidebar({
           <svg className="w-[18px] h-[18px] flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
           </svg>
-          New Research
+          New Policy Research
         </button>
 
-        {/* Research Library */}
+        {/* Policy Library */}
         <button
           onClick={onShowLibrary}
           className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl border font-semibold transition-colors text-sm ${
@@ -532,7 +540,7 @@ function Sidebar({
           <svg className="w-[18px] h-[18px] flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M8 14v3m4-3v3m4-3v3M3 21h18M3 10h18M3 7l9-4 9 4M4 10h16v11H4V10z" />
           </svg>
-          Research Library
+          Policy Library
         </button>
 
         {/* Eval Dashboard */}
@@ -675,6 +683,7 @@ export default function Home() {
     { id: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash', description: 'Fast frontier model from Google' },
   ]);
   const [selectedModel, setSelectedModel] = useState('gpt-5.4');
+  const [runMode, setRunMode] = useState<ResearchMode>('multi_agent_verified');
 
   // Debate mode: two cross-provider agents argue over the findings pre-synthesis
   const [debateMode,     setDebateMode]     = useState(false);
@@ -815,6 +824,7 @@ export default function Home() {
     setSupervisorThinking(''); setSupervisorThinkingExpanded(false);
     setSynthesizingActive(false); setCopied(false);
     setUsageStats(entry.usageStats);
+    setRunMode(entry.runMode ?? 'multi_agent_verified');
     setDebateTurns(entry.debateTurns ?? []);  // old localStorage entries lack this
     setGapSubtasks(entry.gapSubtasks ?? []);
     setDebatingActive(false); setDebateExpanded(false); setDebateStreaming(null);
@@ -834,7 +844,7 @@ export default function Home() {
     setResearchEndTime(restoredPhase === 'done' && lastLog ? (lastLog.serverTs ?? lastLog.createdAt) : null);
   }
 
-  // Fetch selectable lead models for the New Research page — overrides the
+  // Fetch selectable lead models for the New Policy Research page — overrides the
   // hardcoded fallback above once the (possibly cold-starting) backend responds.
   useEffect(() => {
     fetch(`${API}/models`)
@@ -907,9 +917,9 @@ export default function Home() {
   useEffect(() => {
     if (!activeId) return;
     setHistory(prev => prev.map(h => h.id === activeId
-      ? { ...h, query, title, runId, phase, subtasks, sources, log, report, showReport, chatMessages, usageStats, debateTurns, gapSubtasks, debateRun, debateVerdict }
+      ? { ...h, query, title, runId, phase, subtasks, sources, log, report, showReport, chatMessages, usageStats, runMode, debateTurns, gapSubtasks, debateRun, debateVerdict }
       : h));
-  }, [activeId, phase, query, title, runId, subtasks, sources, log, report, showReport, chatMessages, usageStats, debateTurns, gapSubtasks, debateRun, debateVerdict]);
+  }, [activeId, phase, query, title, runId, subtasks, sources, log, report, showReport, chatMessages, usageStats, runMode, debateTurns, gapSubtasks, debateRun, debateVerdict]);
 
   // ---------------------------------------------------------------------------
   // Progress + milestones. Stage budgets differ per mode so the first research
@@ -971,8 +981,8 @@ export default function Home() {
   useEffect(() => {
     const currentStep = log.length > 0 ? log[log.length - 1].label : milestones[milestoneIdx];
     document.title = phase === 'researching'
-      ? `${progressPct}% · ${currentStep} — MindClash`
-      : 'MindClash';
+      ? `${progressPct}% · ${currentStep} — AI Policy Researcher`
+      : 'AI Policy Researcher';
   }, [phase, progressPct, milestones, milestoneIdx, log]);
 
   const displayQuery = title || (query ? query.charAt(0).toUpperCase() + query.slice(1) : '');
@@ -1024,6 +1034,7 @@ export default function Home() {
       const count = (data.findings_count as number) ?? 0;
       const srcs  = (data.sources as string[]) ?? [];
       const stage = data.stage === 'gap' ? 'gap' : 'plan';
+      const shouldCompact = data.compaction !== false;
       const markDone = (s: SubtaskState) => s.question === q ? { ...s, status: 'done' as const, findingsCount: count } : s;
       const list = stage === 'gap' ? gapSubtasksRef.current : subtasksRef.current;
       const idx = list.findIndex(s => s.question === q);
@@ -1038,7 +1049,12 @@ export default function Home() {
       const sp = stageProgress.current[stage];
       sp.done += 1;
       if (sp.total > 0 && sp.done >= sp.total) {
-        addLog('synthesis', 'Compacting Findings', 'All questions answered — merging findings into a compact research summary', serverTs);
+        if (shouldCompact) {
+          addLog('synthesis', 'Compacting Findings', 'All questions answered — merging findings into a compact research summary', serverTs);
+        } else {
+          setSynthesizingActive(true);
+          addLog('synthesis', 'Synthesizing Findings', undefined, serverTs);
+        }
       }
     } else if (type === 'debating') {
       setDebatingActive(true);
@@ -1157,6 +1173,7 @@ export default function Home() {
   async function startResearch(presetQuery?: string) {
     const trimmed = (presetQuery ?? query).trim();
     if (!trimmed) return;
+    const activeRunMode: ResearchMode = debateMode ? 'multi_agent_verified' : runMode;
     setQuery(trimmed);
     setPhase('querying');
     setTitle('');
@@ -1165,7 +1182,7 @@ export default function Home() {
     setSupervisorThinking(''); setSupervisorThinkingExpanded(false);
     setSynthesizingActive(false); setResearchEndTime(null); setUsageStats(null);
     setDebateTurns([]); setDebatingActive(false); setDebateExpanded(true); setDebateStreaming(null);
-    setDebateRun(debateMode); setJudgingActive(false); setDebateVerdict(null);
+    setDebateRun(debateMode); setRunMode(activeRunMode); setJudgingActive(false); setDebateVerdict(null);
     setGapSubtasks([]); setGapPlanningActive(false);
     setPlanCardsExpanded(true); setGapCardsExpanded(true);
     maxProgress.current = 0;
@@ -1181,7 +1198,7 @@ export default function Home() {
     setHistory(prev => [{
       id, query: trimmed, title: '', runId: '', createdAt: Date.now(), phase: 'querying',
       subtasks: [], sources: [], log: [], report: '', showReport: false, chatMessages: [],
-      usageStats: null, debateTurns: [], gapSubtasks: [], debateRun: debateMode, debateVerdict: null,
+      usageStats: null, runMode: activeRunMode, debateTurns: [], gapSubtasks: [], debateRun: debateMode, debateVerdict: null,
     }, ...prev]);
 
     try {
@@ -1190,6 +1207,7 @@ export default function Home() {
         body: JSON.stringify({
           query: trimmed,
           model: selectedModel || undefined,
+          mode: activeRunMode,
           debate: debateMode,
           advocate_model: debateMode ? advocateModel || undefined : undefined,
           skeptic_model: debateMode ? skepticModel || undefined : undefined,
@@ -1378,6 +1396,7 @@ export default function Home() {
     if (!window.confirm('Delete this research from history?')) return;
     const entry = history.find(h => h.id === id);
     setHistory(prev => prev.filter(h => h.id !== id));
+    if (entry?.runId) setPublicRuns(prev => prev.filter(run => run.id !== entry.runId));
     if (id === activeId) reset();
     if (entry?.runId) {
       fetch(`${API}/runs/${entry.runId}`, { method: 'DELETE', headers: { 'X-Client-Id': clientId } })
@@ -1404,6 +1423,7 @@ export default function Home() {
       showReport: true,
       chatMessages: [],
       usageStats: null,
+      runMode: (data.mode ?? 'multi_agent_verified') as ResearchMode,
       debateTurns: data.debate_turns ?? [],
       debateRun: (data.debate_turns ?? []).length > 0,
       debateVerdict: data.debate_verdict ?? null,
@@ -1432,7 +1452,7 @@ export default function Home() {
 
     lines.push(`# ${displayQuery}`, '');
     lines.push(`> **Research query:** ${query}`, '');
-    lines.push(`*Generated by MindClash on ${new Date().toLocaleString()}*`, '');
+    lines.push(`*Generated by AI Policy Researcher on ${new Date().toLocaleString()}*`, '');
 
     if (usageStats) {
       lines.push('## Run Summary', '');
@@ -1554,7 +1574,7 @@ export default function Home() {
           >
             <MenuIcon />
           </button>
-          <h1 className="text-sm font-bold text-gray-900 tracking-tight">MindClash</h1>
+          <h1 className="text-sm font-bold text-gray-900 tracking-tight">AI Policy Researcher</h1>
         </div>
 
         {/* ═══════════ EVAL DASHBOARD ═══════════ */}
@@ -1569,8 +1589,8 @@ export default function Home() {
               <svg className="w-4 h-4 text-indigo-500 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M8 14v3m4-3v3m4-3v3M3 21h18M3 10h18M3 7l9-4 9 4M4 10h16v11H4V10z" />
               </svg>
-              <span className="text-sm font-semibold text-gray-800">Research Library</span>
-              <span className="hidden sm:inline text-xs text-gray-400">· Ask questions across all your past research</span>
+              <span className="text-sm font-semibold text-gray-800">Policy Library</span>
+              <span className="hidden sm:inline text-xs text-gray-400">· Ask questions across past policy reports</span>
               <div className="ml-auto flex items-center gap-2">
                 {libraryChatMessages.length > 0 && (
                   <button
@@ -1604,16 +1624,16 @@ export default function Home() {
                         </svg>
                       </div>
                       <div>
-                        <p className="text-sm font-semibold text-gray-800">Ask your research library</p>
+                        <p className="text-sm font-semibold text-gray-800">Ask your policy library</p>
                         <p className="text-xs text-gray-400 mt-1 max-w-xs">
-                          Questions are answered using relevant passages retrieved from all your completed research reports.
+                          Questions are answered using relevant passages retrieved from your completed AI policy reports.
                         </p>
                       </div>
                       <div className="flex flex-col gap-1.5 text-left w-full max-w-sm">
                         {[
-                          'What have I researched about AI trends?',
-                          'Summarize findings on market analysis topics',
-                          'What sources did my research cite most?',
+                          'Which AI regulations mention high-risk systems?',
+                          'Summarize EU AI Act compliance obligations',
+                          'What policy sources did my reports cite most?',
                         ].map(prompt => (
                           <button
                             key={prompt}
@@ -1703,7 +1723,7 @@ export default function Home() {
                       value={libraryChatInput}
                       onChange={e => setLibraryChatInput(e.target.value)}
                       onKeyDown={e => e.key === 'Enter' && !e.shiftKey && sendLibraryChat()}
-                      placeholder="Ask anything across your past research…"
+                      placeholder="Ask across your AI policy reports…"
                       disabled={libraryChatStreaming}
                       className="flex-1 border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-indigo-400 disabled:bg-gray-50"
                     />
@@ -1768,7 +1788,7 @@ export default function Home() {
                     ) : libraryEvalResult ? (
                       <div className="px-3 py-3 space-y-3">
                         {/* Score cards */}
-                        <div className="grid grid-cols-2 gap-2">
+                        <div className="space-y-2">
                           {[
                             { label: 'Context Precision', value: libraryEvalResult.context_precision, sub: `${libraryEvalResult.chunk_verdicts.filter(v => v.relevant).length}/${libraryEvalResult.chunk_verdicts.length} chunks relevant` },
                             { label: 'Context Sufficiency', value: libraryEvalResult.context_sufficiency, sub: libraryEvalResult.context_sufficiency_verdict.reasoning },
@@ -1779,12 +1799,14 @@ export default function Home() {
                             const bar = pct >= 80 ? 'bg-emerald-500' : pct >= 50 ? 'bg-amber-400' : 'bg-red-400';
                             return (
                               <div key={label} className="bg-white border border-gray-200 rounded-xl px-3 py-2.5">
-                                <p className="text-[10px] uppercase tracking-wide text-gray-400 font-semibold leading-tight">{label}</p>
-                                <p className="text-xl font-bold text-gray-900 mt-1">{pct}%</p>
-                                <div className="w-full bg-gray-100 rounded-full h-1 mt-1.5">
+                                <div className="flex items-baseline justify-between gap-3">
+                                  <p className="text-[10px] uppercase tracking-wide text-gray-400 font-semibold leading-tight">{label}</p>
+                                  <p className="text-xl font-bold text-gray-900">{pct}%</p>
+                                </div>
+                                <div className="w-full bg-gray-100 rounded-full h-1 mt-2">
                                   <div className={`h-1 rounded-full ${bar}`} style={{ width: `${pct}%` }} />
                                 </div>
-                                <p className="text-[10px] text-gray-400 mt-1">{sub}</p>
+                                <p className="text-[10px] text-gray-400 mt-1.5 leading-relaxed">{sub}</p>
                               </div>
                             );
                           })}
@@ -1942,9 +1964,9 @@ export default function Home() {
               <div className="flex-1 flex flex-col items-center justify-center gap-4 px-4 sm:px-6 text-center">
                 <span className="text-5xl mb-1">📝</span>
                 <div className="flex flex-col items-center gap-1">
-                  <h2 className="text-2xl font-bold text-gray-900">Start Your Research</h2>
+                  <h2 className="text-2xl font-bold text-gray-900">Start AI Policy Research</h2>
                   <p className="text-gray-400 text-sm max-w-md">
-                    Ask a question to begin comprehensive AI-powered deep research
+                    Track AI laws, obligations, enforcement risk, and policy shifts with cited evidence.
                   </p>
                 </div>
                 {phase === 'error' && (
@@ -1958,7 +1980,7 @@ export default function Home() {
                       value={query}
                       onChange={e => setQuery(e.target.value)}
                       onKeyDown={e => e.key === 'Enter' && phase === 'idle' && startResearch()}
-                      placeholder="What are the top AI trends shaping 2026?"
+                      placeholder="How is Singapore regulating AI governance and model risk in 2026?"
                       disabled={phase === 'querying'}
                       className="w-full bg-transparent px-4 pt-4 pb-2 text-sm focus:outline-none disabled:text-gray-600 disabled:cursor-default min-h-[64px]"
                     />
@@ -1986,11 +2008,20 @@ export default function Home() {
                         </button>
                         {debateInfoOpen && (
                           <div className="absolute bottom-full left-0 mb-2 w-64 bg-gray-900 text-white text-xs text-left leading-relaxed rounded-xl shadow-lg px-3 py-2.5 z-10">
-                            When enabled, two AI models challenge each other’s answers, identify weaknesses and missing information, then do extra research before producing a final response. This takes longer but often results in a more thorough and accurate answer.
+                            When enabled, two AI models challenge each other’s policy analysis, identify weak evidence and missing jurisdictions, then do extra research before producing a final report. This takes longer but often results in a more thorough answer.
                             <div className="absolute top-full left-4 w-2 h-2 bg-gray-900 rotate-45 -mt-1" />
                           </div>
                         )}
                       </div>
+                      <span className="flex items-center gap-1">
+                        <span className="hidden sm:inline text-[11px] text-gray-400 font-medium">Quality</span>
+                        <ModelPicker
+                          options={RESEARCH_MODE_OPTIONS}
+                          value={debateMode ? 'multi_agent_verified' : runMode}
+                          onChange={id => setRunMode(id as ResearchMode)}
+                          disabled={phase === 'querying' || debateMode}
+                        />
+                      </span>
                       {modelOptions.length > 0 && (
                         <ModelPicker
                           options={modelOptions}
@@ -2010,7 +2041,7 @@ export default function Home() {
                     {debateMode && (
                       <div className="flex flex-col gap-1.5 px-4 pb-3 pt-2 border-t border-gray-100">
                         <span className="hidden sm:block text-[11px] text-gray-400 text-left">
-                          Two agents from different AI companies debate the findings
+                          Two agents from different AI companies debate the policy findings
                         </span>
                         <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
                           {/* Label + picker wrap together as one unit */}
@@ -2150,7 +2181,7 @@ export default function Home() {
             {/* Header */}
             <div className="flex-shrink-0 h-12 border-b border-gray-200 flex items-center justify-between px-4 sm:px-6 gap-3">
               <div className="flex items-center gap-3 min-w-0">
-                <span className="text-sm font-semibold text-gray-800 truncate">Research Session</span>
+                <span className="text-sm font-semibold text-gray-800 truncate">Policy Research Session</span>
                 {phase === 'researching' && (
                   <span className="flex items-center gap-1.5 text-xs text-emerald-600 font-medium flex-shrink-0">
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" /> Live
@@ -2220,7 +2251,7 @@ export default function Home() {
                     <div className="flex-shrink-0 flex items-center gap-2">
                       <button
                         onClick={downloadSessionMarkdown}
-                        title="Download the full session (questions, debate, report) as Markdown"
+                        title="Download the full policy session (questions, debate, report) as Markdown"
                         className="flex items-center gap-1.5 text-xs font-semibold rounded-lg px-3 py-1.5 border bg-white border-gray-300 text-gray-600 hover:border-gray-400 hover:text-gray-800 transition-colors"
                       >
                         <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -2231,7 +2262,7 @@ export default function Home() {
                       <button
                         onClick={downloadSessionDocx}
                         disabled={docxBusy}
-                        title="Download the full session (questions, debate, report) as a Word document"
+                        title="Download the full policy session (questions, debate, report) as a Word document"
                         className="flex items-center gap-1.5 text-xs font-semibold rounded-lg px-3 py-1.5 border bg-white border-gray-300 text-gray-600 hover:border-gray-400 hover:text-gray-800 transition-colors disabled:opacity-50 disabled:cursor-default"
                       >
                         {docxBusy ? <Spinner /> : (
@@ -2261,7 +2292,7 @@ export default function Home() {
                             <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                               <path strokeLinecap="round" strokeLinejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
                             </svg>
-                            Copy Report
+                            Copy Policy Report
                           </>
                         )}
                       </button>
@@ -2270,7 +2301,7 @@ export default function Home() {
                   </div>
                   {phase === 'researching' && (
                     <p className="mt-2 flex items-center gap-1.5 text-sm text-blue-600">
-                      <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse" /> Researching…
+                      <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse" /> Researching policy sources...
                     </p>
                   )}
                 </div>
@@ -2280,7 +2311,7 @@ export default function Home() {
                   <div className="mx-4 sm:mx-6 lg:mx-8 mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-5 py-3.5 flex items-center gap-2">
                     <span className="text-base">✨</span>
                     <span className="text-sm font-semibold text-gray-800">
-                      Research completed! Final report is ready to display.
+                      Policy research completed. Final report is ready to display.
                     </span>
                   </div>
                 )}
@@ -2627,10 +2658,10 @@ export default function Home() {
                     {chatMessages.length === 0 && (
                       <div className="flex flex-wrap gap-2">
                         {[
-                          'Summarize the key findings in 3 bullet points',
-                          'What is the strongest evidence here?',
-                          'What are the main uncertainties or limitations?',
-                          'What should I research next?',
+                          'What obligations matter most?',
+                          'Which claims rely on official sources?',
+                          'What are the main compliance uncertainties?',
+                          'Which jurisdictions should I compare next?',
                         ].map(q => (
                           <button
                             key={q}
@@ -2648,7 +2679,7 @@ export default function Home() {
                         value={chatInput}
                         onChange={e => setChatInput(e.target.value)}
                         onKeyDown={e => e.key === 'Enter' && !e.shiftKey && sendChat()}
-                        placeholder="Ask a follow-up question…"
+                        placeholder="Ask a policy follow-up question..."
                         disabled={chatStreaming}
                         className="flex-1 border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none disabled:bg-gray-50"
                       />

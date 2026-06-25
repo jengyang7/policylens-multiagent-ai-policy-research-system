@@ -110,6 +110,17 @@ def test_split_sentences_tracks_section_and_uncited() -> None:
     assert all(sec == "Overview" for _, sec in sentences)
 
 
+def test_split_sentences_normalizes_spaced_initialisms() -> None:
+    body = "## Overview\n\nIn the U. S., courts require human authorship [1]. D. C. affirmed it."
+
+    sentences = [sentence for sentence, _section in split_sentences(body)]
+
+    assert sentences == [
+        "In the U.S., courts require human authorship [1].",
+        "D.C. affirmed it.",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # grounding
 # ---------------------------------------------------------------------------
@@ -305,12 +316,68 @@ async def test_verify_citations_removes_unfaithful_sentence(monkeypatch) -> None
         )
 
     monkeypatch.setattr("engine.nodes.verify_citations.run_faithfulness_checks", fake_faithfulness)
+
+    async def fake_coverage(report, lead_model):
+        return CitationCoverageResult(
+            coverage_score=1.0,
+            cited_sentence_count=1,
+            uncited_factual_claims=[],
+        ), []
+
+    monkeypatch.setattr("engine.nodes.verify_citations.run_citation_coverage_check", fake_coverage)
     result = await verify_citations(  # type: ignore[typeddict-item]
         {"report": report, "findings": [_finding("evidence", "https://a.com")]}
     )
     verified_report = str(result["report"])
     assert "Supported claim [1]." in verified_report
     assert "Unsupported claim" not in verified_report
+
+
+async def test_verify_citations_removes_uncited_factual_sentence(monkeypatch) -> None:
+    report = (
+        "Supported claim [1]. Uncited factual claim.\n\n"
+        "## References\n\n[1] [Source A](https://a.com)\n"
+    )
+
+    async def fake_faithfulness(report, findings, lead_model):
+        return (
+            [
+                FaithfulnessVerdict(
+                    citation_index=1,
+                    report_sentence="Supported claim",
+                    matched_finding_claims=["c"],
+                    faithful=True,
+                    confidence=1.0,
+                    reasoning="ok",
+                ),
+            ],
+            [],
+            [],
+        )
+
+    async def fake_coverage(report, lead_model):
+        return CitationCoverageResult(
+            coverage_score=0.5,
+            cited_sentence_count=1,
+            uncited_factual_claims=[
+                {
+                    "sentence": "Uncited factual claim.",
+                    "section": "",
+                    "reasoning": "needs a citation",
+                }
+            ],
+        ), []
+
+    monkeypatch.setattr("engine.nodes.verify_citations.run_faithfulness_checks", fake_faithfulness)
+    monkeypatch.setattr("engine.nodes.verify_citations.run_citation_coverage_check", fake_coverage)
+
+    result = await verify_citations(  # type: ignore[typeddict-item]
+        {"report": report, "findings": [_finding("evidence", "https://a.com")]}
+    )
+
+    verified_report = str(result["report"])
+    assert "Supported claim [1]." in verified_report
+    assert "Uncited factual claim" not in verified_report
 
 
 # ---------------------------------------------------------------------------

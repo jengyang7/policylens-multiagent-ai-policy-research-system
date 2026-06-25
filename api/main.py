@@ -10,6 +10,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from dotenv import load_dotenv
@@ -35,7 +36,7 @@ from engine.models import (
     role_default_models,
 )
 from engine.nodes.chat import answer_followup
-from engine.orchestrator import DEFAULT_DEBATE_ROUNDS, build_graph
+from engine.orchestrator import DEFAULT_DEBATE_ROUNDS, DEFAULT_RUN_MODE, build_graph
 from engine.state import TokenUsage
 from eval.harness import evaluate_run
 from eval.rag_eval import evaluate_rag
@@ -85,7 +86,7 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     _checkpointer = None
 
 
-app = FastAPI(title="Deep Research API", lifespan=lifespan)
+app = FastAPI(title="AI Policy Researcher API", lifespan=lifespan)
 
 _allowed_origins = [
     o.strip()
@@ -119,6 +120,12 @@ async def _unhandled(request: Request, exc: Exception) -> JSONResponse:
 class ResearchRequest(BaseModel):
     query: str
     model: str | None = None
+    mode: Literal[
+        "single_agent",
+        "multi_agent_no_compaction",
+        "multi_agent_compaction",
+        "multi_agent_verified",
+    ] = DEFAULT_RUN_MODE
     # Debate mode: two cross-provider agents argue over the findings pre-synthesis
     debate: bool = False
     advocate_model: str | None = None
@@ -243,6 +250,7 @@ async def _stream_graph(
     input_: dict[str, object] | Command,
     debate_mode: bool = False,
     debate_rounds: int = DEFAULT_DEBATE_ROUNDS,
+    run_mode: str = DEFAULT_RUN_MODE,
 ) -> AsyncGenerator[dict[str, str], None]:
     """Stream LangGraph node updates as SSE events.
 
@@ -267,6 +275,10 @@ async def _stream_graph(
     config = {"configurable": {"thread_id": run_id}}
     start_time = time.time()
     findings_for_index: list[dict[str, object]] = []
+    compaction_enabled = debate_mode or run_mode in {
+        "multi_agent_compaction",
+        "multi_agent_verified",
+    }
 
     yield _evt({"type": "started", "run_id": run_id})
 
@@ -303,12 +315,25 @@ async def _stream_graph(
                         yield _evt({"type": "plan_thinking", "content": thinking})
                     yield _evt({"type": "plan", "subtasks": subtasks, "title": title})
 
-                elif node_name in ("subagent", "gap_subagent"):
+                elif node_name in ("single_agent", "subagent", "gap_subagent"):
                     findings: list[dict[str, object]] = node_output.get("findings", [])  # type: ignore[union-attr]
                     findings_for_index.extend(findings)
                     processed: list[str] = node_output.get("processed_subtasks", [])
                     fallback = findings[0]["subtask"] if findings else ""
                     question = processed[0] if processed else fallback
+                    if node_name == "single_agent":
+                        plan_question = question or (
+                            input_.get("query", "") if isinstance(input_, dict) else ""
+                        )
+                        question = str(plan_question)
+                        await _update_run(
+                            run_id, "running", plan={"subtasks": [question]}
+                        )
+                        yield _evt({
+                            "type": "plan",
+                            "subtasks": [question],
+                            "title": "",
+                        })
                     sources = list({
                         f["citation_url"] for f in findings if f.get("citation_url")
                     })
@@ -319,6 +344,7 @@ async def _stream_graph(
                         "sources": sources,
                         # "gap" = second, debate-driven research round
                         "stage": "gap" if node_name == "gap_subagent" else "plan",
+                        "compaction": compaction_enabled or node_name == "gap_subagent",
                     })
 
                 elif node_name == "compact":
@@ -360,6 +386,15 @@ async def _stream_graph(
                     # into gap questions
                     yield _evt({"type": "gap_planning"})
 
+                elif node_name == "synthesize":
+                    if run_mode != "multi_agent_verified" and not debate_mode:
+                        report: str = node_output.get("report", "")  # type: ignore[union-attr]
+                        if report:
+                            asyncio.create_task(
+                                _save_and_embed_report(run_id, report, list(findings_for_index))
+                            )
+                        yield _evt({"type": "report", "content": report, "run_id": run_id})
+
                 elif node_name == "verify_citations":
                     report: str = node_output.get("report", "")  # type: ignore[union-attr]
                     if report:
@@ -396,6 +431,7 @@ async def _stream_graph(
         usage = {
             "lead_model": lead_model,
             "subagent_model": SUBAGENT_MODEL,
+            "mode": "debate_gap" if snapshot.values.get("debate_mode") else run_mode,
             "input_tokens": sum(u["input_tokens"] for u in token_usage),
             "output_tokens": sum(u["output_tokens"] for u in token_usage),
             "cached_tokens": sum(u["cached_tokens"] for u in token_usage),
@@ -445,6 +481,7 @@ async def start_research(body: ResearchRequest, request: Request) -> EventSource
     lead_model = body.model or defaults["lead"]
     advocate_model = body.advocate_model or defaults["advocate"]
     skeptic_model = body.skeptic_model or defaults["skeptic"]
+    run_mode = "multi_agent_verified" if body.debate else body.mode
 
     run_id = str(uuid.uuid4())
     async with _session_factory() as session:
@@ -457,6 +494,7 @@ async def start_research(body: ResearchRequest, request: Request) -> EventSource
         "run_id": run_id,
         "query": body.query,
         "lead_model": lead_model,
+        "run_mode": run_mode,
         "clarification_questions": [],
         "clarification_options": [],
         "clarifications": [],
@@ -476,7 +514,14 @@ async def start_research(body: ResearchRequest, request: Request) -> EventSource
         "skeptic_model": skeptic_model,
         "debate_turns": [],
     }
-    return EventSourceResponse(_stream_graph(run_id, initial_state, debate_mode=body.debate))
+    return EventSourceResponse(
+        _stream_graph(
+            run_id,
+            initial_state,
+            debate_mode=body.debate,
+            run_mode=run_mode,
+        )
+    )
 
 
 @app.post("/runs/{run_id}/resume")
@@ -500,6 +545,10 @@ async def resume_run(run_id: str, body: ResumeRequest) -> EventSourceResponse:
         int(snapshot.values.get("debate_rounds", DEFAULT_DEBATE_ROUNDS))
         if snapshot else DEFAULT_DEBATE_ROUNDS
     )
+    run_mode = (
+        str(snapshot.values.get("run_mode", DEFAULT_RUN_MODE))
+        if snapshot else DEFAULT_RUN_MODE
+    )
 
     return EventSourceResponse(
         _stream_graph(
@@ -507,6 +556,7 @@ async def resume_run(run_id: str, body: ResumeRequest) -> EventSourceResponse:
             Command(resume=body.answers),
             debate_mode=debate_mode,
             debate_rounds=debate_rounds,
+            run_mode=run_mode,
         )
     )
 
@@ -528,11 +578,13 @@ async def get_run(run_id: str) -> dict[str, object]:
     findings: list[object] = []
     debate_turns: list[object] = []
     debate_verdict: object = None
+    run_mode = DEFAULT_RUN_MODE
     if snapshot:
         report = snapshot.values.get("report", "")  # type: ignore[union-attr]
         findings = snapshot.values.get("findings", [])  # type: ignore[union-attr]
         debate_turns = snapshot.values.get("debate_turns", [])  # type: ignore[union-attr]
         debate_verdict = snapshot.values.get("debate_verdict")  # type: ignore[union-attr]
+        run_mode = snapshot.values.get("run_mode", DEFAULT_RUN_MODE)  # type: ignore[assignment,union-attr]
 
     return {
         "id": run.id,
@@ -540,6 +592,7 @@ async def get_run(run_id: str) -> dict[str, object]:
         "title": run.title,
         "status": run.status,
         "plan": run.plan,
+        "mode": run_mode,
         "clarifications": run.clarifications,
         "report": report,
         "findings": findings,
@@ -552,9 +605,13 @@ async def get_run(run_id: str) -> dict[str, object]:
 
 @app.get("/runs")
 async def list_runs(
-    request: Request, status: str | None = None, limit: int = 50
+    request: Request, status: str | None = None, limit: int = 50, mine: bool = False
 ) -> list[dict[str, object]]:
-    """List all research runs, most recently started first (public — no client scoping)."""
+    """List research runs, most recent first.
+
+    Public by default for the sidebar/community demo. `mine=true` scopes the
+    list to the anonymous visitor id for private eval/benchmark views.
+    """
     assert _session_factory is not None
 
     stmt = (
@@ -564,6 +621,11 @@ async def list_runs(
     )
     if status is not None:
         stmt = stmt.where(ResearchRun.status == status)
+    if mine:
+        client_id = _client_id(request)
+        if client_id is None:
+            return []
+        stmt = stmt.where(ResearchRun.client_id == client_id)
 
     async with _session_factory() as session:
         result = await session.execute(stmt)
@@ -745,11 +807,19 @@ async def community_eval_trend(limit: int = 200) -> list[dict[str, object]]:
 async def list_eval_reports(
     request: Request, run_id: str | None = None, limit: int = 100
 ) -> list[dict[str, object]]:
-    """List persisted eval report summaries (no full report body), most recent first (public)."""
+    """List this visitor's eval report summaries, most recent first.
+
+    Community aggregates stay public via /eval/summary and
+    /eval/reports/community; individual reports stay scoped to X-Client-Id.
+    """
     assert _session_factory is not None
+    client_id = _client_id(request)
+    if client_id is None:
+        return []
 
     stmt = (
         select(EvalReportRecord)
+        .where(EvalReportRecord.client_id == client_id)
         .order_by(EvalReportRecord.generated_at.desc())
         .limit(limit)
     )
@@ -765,12 +835,18 @@ async def list_eval_reports(
 
 @app.get("/eval/reports/{report_id}")
 async def get_eval_report(report_id: str, request: Request) -> dict[str, object]:
-    """Full persisted eval report, including grounding/faithfulness detail."""
+    """Full persisted eval report, scoped to this visitor."""
     assert _session_factory is not None
+    client_id = _client_id(request)
+    if client_id is None:
+        raise HTTPException(404, "Eval report not found")
 
     async with _session_factory() as session:
         result = await session.execute(
-            select(EvalReportRecord).where(EvalReportRecord.id == report_id)
+            select(EvalReportRecord).where(
+                EvalReportRecord.id == report_id,
+                EvalReportRecord.client_id == client_id,
+            )
         )
         record = result.scalar_one_or_none()
         if record is None:

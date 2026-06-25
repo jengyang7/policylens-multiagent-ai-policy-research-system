@@ -30,6 +30,23 @@ _BULLET_LINE_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+(.*)$")
 # Split a paragraph into sentences on '.', '!' or '?' followed by whitespace
 # and the start of the next sentence (uppercase letter, digit, or a [i] marker).
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\[])")
+_SPACED_INITIALISM_RE = re.compile(r"\b([A-Z])\.\s+([A-Z])\.")
+
+
+def _normalize_sentence_text(text: str) -> str:
+    """Normalize artifacts that confuse sentence splitting.
+
+    Some providers emit spaced initialisms ("U. S.", "D. C.", "U. K."). The
+    sentence splitter then treats "In the U." as a full sentence, which inflates
+    uncited-claim counts and makes faithfulness reports noisy. Collapse those
+    two-letter initialisms before splitting; longer initialisms are handled
+    through repeated passes (e.g. "U. S. A." -> "U.S.A.").
+    """
+    previous = None
+    while previous != text:
+        previous = text
+        text = _SPACED_INITIALISM_RE.sub(r"\1.\2.", text)
+    return text
 
 
 def split_body_and_references(report: str) -> tuple[str, str]:
@@ -96,7 +113,7 @@ def split_sentences(body: str) -> list[tuple[str, str]]:
     def flush_paragraph() -> None:
         if not paragraph_lines:
             return
-        paragraph = " ".join(paragraph_lines).strip()
+        paragraph = _normalize_sentence_text(" ".join(paragraph_lines).strip())
         paragraph_lines.clear()
         if not paragraph:
             return

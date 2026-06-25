@@ -99,6 +99,7 @@ async def run_faithfulness_checks(
     findings_by_url: dict[str, list[SubtaskFinding]] = {}
     for f in findings:
         findings_by_url.setdefault(f["citation_url"], []).append(f)
+    source_urls = list(dict.fromkeys(f["citation_url"] for f in findings))
 
     verdicts: list[FaithfulnessVerdict] = []
     uncited: list[UncitedSentence] = []
@@ -119,11 +120,15 @@ async def run_faithfulness_checks(
             ref = citation_map.get(index)
             if ref is not None:
                 candidate_findings.extend(findings_by_url.get(ref.url, []))
+            elif 1 <= index <= len(source_urls):
+                # Source-based synthesis uses one [i] per unique URL. If the
+                # LLM omitted References, fall back to that source map and give
+                # the judge all findings collected from the cited source.
+                candidate_findings.extend(findings_by_url.get(source_urls[index - 1], []))
             elif 1 <= index <= len(findings):
                 # The synthesizer's own References list omitted (or never wrote)
-                # this index — fall back to the same 1-indexed mapping into
-                # `findings` that _rebuild_references uses, so a missing/
-                # malformed References section doesn't auto-fail every citation.
+                # this index — keep the old finding-index fallback for legacy
+                # reports generated before source-based citations.
                 candidate_findings.append(findings[index - 1])
             else:
                 unresolved_index = index

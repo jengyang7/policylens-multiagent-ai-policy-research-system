@@ -175,6 +175,17 @@ async def test_verify_citations_removes_unfaithful_sentences(
 
     monkeypatch.setattr(verify_mod, "run_faithfulness_checks", fake_checks)
 
+    async def fake_coverage(report: str, lead_model: str):
+        from eval.schema import CitationCoverageResult
+
+        return CitationCoverageResult(
+            coverage_score=1.0,
+            cited_sentence_count=1,
+            uncited_factual_claims=[],
+        ), []
+
+    monkeypatch.setattr(verify_mod, "run_citation_coverage_check", fake_coverage)
+
     state: ResearchState = {
         "run_id": str(uuid.uuid4()),
         "query": "test query",
@@ -208,6 +219,75 @@ async def test_verify_citations_removes_unfaithful_sentences(
     assert "[2] [B](https://b.com)" not in report
 
 
+async def test_verify_citations_normalizes_sentence_spacing_before_judge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import engine.nodes.verify_citations as verify_mod
+    from eval.schema import FaithfulnessVerdict
+
+    captured: dict[str, str] = {}
+
+    async def fake_checks(
+        report: str, findings: list[object], lead_model: str
+    ) -> tuple[list[FaithfulnessVerdict], list[object], list[object]]:
+        captured["report"] = report
+        return [
+            FaithfulnessVerdict(
+                citation_index=1,
+                report_sentence="First claim.",
+                matched_finding_claims=["A claim"],
+                faithful=True,
+                confidence=1.0,
+                reasoning="supported",
+            ),
+            FaithfulnessVerdict(
+                citation_index=1,
+                report_sentence="However, second claim.",
+                matched_finding_claims=["A claim"],
+                faithful=True,
+                confidence=1.0,
+                reasoning="supported",
+            ),
+        ], [], []
+
+    monkeypatch.setattr(verify_mod, "run_faithfulness_checks", fake_checks)
+
+    async def fake_coverage(report: str, lead_model: str):
+        from eval.schema import CitationCoverageResult
+
+        return CitationCoverageResult(
+            coverage_score=1.0,
+            cited_sentence_count=1,
+            uncited_factual_claims=[],
+        ), []
+
+    monkeypatch.setattr(verify_mod, "run_citation_coverage_check", fake_coverage)
+
+    state: ResearchState = {
+        "run_id": str(uuid.uuid4()),
+        "query": "test query",
+        "clarification_questions": [],
+        "clarifications": [],
+        "subtasks": [],
+        "findings": [
+            {
+                "subtask": "q1",
+                "claim": "A claim",
+                "evidence_span": "evidence",
+                "citation_url": "https://example.com",
+            }
+        ],
+        "summary": "summary",
+        "report": "First claim [1] .However, second claim [1].",
+        "messages": [],
+    }
+
+    result = await verify_mod.verify_citations(state)
+
+    assert "First claim [1]. However, second claim [1]." in captured["report"]
+    assert "First claim [1]. However, second claim [1]." in str(result["report"])
+
+
 async def test_verify_citations_fills_in_missing_reference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -232,6 +312,17 @@ async def test_verify_citations_fills_in_missing_reference(
         return verdicts, [], []
 
     monkeypatch.setattr(verify_mod, "run_faithfulness_checks", fake_checks)
+
+    async def fake_coverage(report: str, lead_model: str):
+        from eval.schema import CitationCoverageResult
+
+        return CitationCoverageResult(
+            coverage_score=1.0,
+            cited_sentence_count=1,
+            uncited_factual_claims=[],
+        ), []
+
+    monkeypatch.setattr(verify_mod, "run_citation_coverage_check", fake_coverage)
 
     state: ResearchState = {
         "run_id": str(uuid.uuid4()),
@@ -268,7 +359,7 @@ async def test_verify_citations_fills_in_missing_reference(
     assert "[1] [A](https://a.com)" not in report
 
 
-async def test_verify_citations_groups_duplicate_reference_urls(
+async def test_verify_citations_does_not_group_duplicate_reference_urls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import engine.nodes.verify_citations as verify_mod
@@ -298,6 +389,17 @@ async def test_verify_citations_groups_duplicate_reference_urls(
         return verdicts, [], []
 
     monkeypatch.setattr(verify_mod, "run_faithfulness_checks", fake_checks)
+
+    async def fake_coverage(report: str, lead_model: str):
+        from eval.schema import CitationCoverageResult
+
+        return CitationCoverageResult(
+            coverage_score=1.0,
+            cited_sentence_count=1,
+            uncited_factual_claims=[],
+        ), []
+
+    monkeypatch.setattr(verify_mod, "run_citation_coverage_check", fake_coverage)
 
     state: ResearchState = {
         "run_id": str(uuid.uuid4()),
@@ -330,7 +432,10 @@ async def test_verify_citations_groups_duplicate_reference_urls(
     }
     result = await verify_mod.verify_citations(state)
     report = str(result["report"])
-    assert "[1], [2] [Shared](https://same.com)" in report
+    assert "[1], [2] [Shared](https://same.com)" not in report
+    assert "First claim [1]. Second claim [1]." in report
+    assert "[1] [Shared](https://same.com)" in report
+    assert "[2] [Shared](https://same.com)" not in report
     assert report.count("https://same.com") == 1
 
 
@@ -372,6 +477,17 @@ async def test_verify_citations_removes_empty_numbered_items_and_bold(
         return verdicts, [], []
 
     monkeypatch.setattr(verify_mod, "run_faithfulness_checks", fake_checks)
+
+    async def fake_coverage(report: str, lead_model: str):
+        from eval.schema import CitationCoverageResult
+
+        return CitationCoverageResult(
+            coverage_score=1.0,
+            cited_sentence_count=1,
+            uncited_factual_claims=[],
+        ), []
+
+    monkeypatch.setattr(verify_mod, "run_citation_coverage_check", fake_coverage)
 
     state: ResearchState = {
         "run_id": str(uuid.uuid4()),
@@ -438,6 +554,17 @@ async def test_verify_citations_strips_non_numeric_markers(
 
     monkeypatch.setattr(verify_mod, "run_faithfulness_checks", fake_checks)
 
+    async def fake_coverage(report: str, lead_model: str):
+        from eval.schema import CitationCoverageResult
+
+        return CitationCoverageResult(
+            coverage_score=1.0,
+            cited_sentence_count=1,
+            uncited_factual_claims=[],
+        ), []
+
+    monkeypatch.setattr(verify_mod, "run_citation_coverage_check", fake_coverage)
+
     state: ResearchState = {
         "run_id": str(uuid.uuid4()),
         "query": "test query",
@@ -466,6 +593,70 @@ async def test_verify_citations_strips_non_numeric_markers(
     # The real markdown link in References must survive — only bracket
     # markers NOT followed by `(url)` are stripped
     assert "[1] [A](https://a.com)" in report
+
+
+async def test_verify_citations_removes_heading_outline_prefixes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import engine.nodes.verify_citations as verify_mod
+    from eval.schema import FaithfulnessVerdict
+
+    async def fake_checks(
+        report: str, findings: list[object], lead_model: str
+    ) -> tuple[list[FaithfulnessVerdict], list[object], list[object]]:
+        return [
+            FaithfulnessVerdict(
+                citation_index=1,
+                report_sentence="Faithful claim.",
+                matched_finding_claims=["A claim"],
+                faithful=True,
+                confidence=1.0,
+                reasoning="supported",
+            )
+        ], [], []
+
+    async def fake_coverage(report: str, lead_model: str):
+        from eval.schema import CitationCoverageResult
+
+        return CitationCoverageResult(
+            coverage_score=1.0,
+            cited_sentence_count=1,
+            uncited_factual_claims=[],
+        ), []
+
+    monkeypatch.setattr(verify_mod, "run_faithfulness_checks", fake_checks)
+    monkeypatch.setattr(verify_mod, "run_citation_coverage_check", fake_coverage)
+
+    state: ResearchState = {
+        "run_id": str(uuid.uuid4()),
+        "query": "test query",
+        "clarification_questions": [],
+        "clarifications": [],
+        "subtasks": [],
+        "findings": [
+            {
+                "subtask": "q1",
+                "claim": "A claim",
+                "evidence_span": "evidence",
+                "citation_url": "https://a.com",
+            }
+        ],
+        "summary": "summary",
+        "report": (
+            "## IX. Open Questions\n\n"
+            "### C. Global Fragmentation\n\n"
+            "Faithful claim [1].\n\n"
+            "## References\n\n[1] [A](https://a.com)\n"
+        ),
+        "messages": [],
+    }
+
+    result = await verify_mod.verify_citations(state)
+    report = str(result["report"])
+    assert "## Open Questions" in report
+    assert "### Global Fragmentation" in report
+    assert "IX. Open Questions" not in report
+    assert "C. Global Fragmentation" not in report
 
 
 async def test_verify_citations_skips_when_no_findings_or_report() -> None:

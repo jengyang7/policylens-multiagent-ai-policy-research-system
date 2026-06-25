@@ -6,54 +6,10 @@ import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 // Types (mirror api/main.py response shapes + eval/schema.py)
 // ---------------------------------------------------------------------------
 
-interface RagChunkVerdict {
-  chunk_index: number;
-  title: string;
-  section: string;
-  preview: string;
-  relevant: boolean;
-  reasoning: string;
-}
-
-interface RagAnswerClaimVerdict {
-  claim: string;
-  supported: boolean;
-  reasoning: string;
-}
-
-interface RagContextSufficiencyVerdict {
-  sufficient: boolean;
-  reasoning: string;
-}
-
-interface RagAnswerRelevanceVerdict {
-  score: number;
-  reasoning: string;
-}
-
-interface RagEvalReport {
-  question: string;
-  generated_at: string;
-  selected_reports: string[];
-  chunks_retrieved: number;
-  chunk_verdicts: RagChunkVerdict[];
-  context_precision: number;
-  context_sufficiency: number;
-  context_sufficiency_verdict: RagContextSufficiencyVerdict;
-  answer: string;
-  claim_verdicts: RagAnswerClaimVerdict[];
-  answer_faithfulness: number;
-  answer_relevance: number;
-  answer_relevance_verdict: RagAnswerRelevanceVerdict;
-  eval_model: string;
-  eval_cost_usd: number;
-  eval_input_tokens: number;
-  eval_output_tokens: number;
-}
-
 interface RunStats {
   lead_model?: string;
   subagent_model?: string;
+  mode?: string;
   input_tokens?: number;
   output_tokens?: number;
   cached_tokens?: number;
@@ -65,6 +21,7 @@ interface RunStats {
 interface RunSummary {
   id: string;
   query: string;
+  title?: string | null;
   status: string;
   started_at: string | null;
   finished_at: string | null;
@@ -92,12 +49,6 @@ interface EvalReportSummary extends RateCounts {
   eval_cost_usd: number;
   recall_score: number;
   relevance_score: number;
-}
-
-// One point on the public "Quality Over Time" trend — aggregated across all
-// visitors, with no query text or identifiers (see GET /eval/reports/community).
-interface CommunityTrendPoint extends RateCounts {
-  generated_at: string;
 }
 
 interface GroundingResult {
@@ -165,6 +116,18 @@ interface EvalReportDetail extends EvalReportSummary {
   };
 }
 
+interface ModelOption {
+  id: string;
+  label: string;
+  description: string;
+}
+
+interface ModelsResponse {
+  default: string;
+  defaults?: { lead?: string; eval?: string; advocate?: string; skeptic?: string };
+  options: ModelOption[];
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -190,16 +153,189 @@ function fmtDate(iso: string | null): string {
   });
 }
 
-function fmtShortDate(iso: string): string {
-  return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-}
-
 function fmtCost(v?: number): string {
   return v === undefined ? '—' : `$${v.toFixed(4)}`;
 }
 
 function fmtScore(v: number | null): string {
   return v === null ? '—' : `${v.toFixed(1)}/5.0`;
+}
+
+function modeLabel(mode?: string): string {
+  const labels: Record<string, string> = {
+    single_agent: 'L1 Single Agent',
+    multi_agent_no_compaction: 'L2 Multi-Agent',
+    multi_agent_compaction: 'L3 Compacted',
+    multi_agent_verified: 'L4 Citation Checked',
+    debate_gap: 'L5 Debate + Gap',
+    legacy: 'Legacy Run',
+    unknown: 'Legacy Run',
+  };
+  return labels[mode ?? ''] ?? 'Unknown';
+}
+
+function modeRank(mode?: string): number {
+  const ranks: Record<string, number> = {
+    single_agent: 1,
+    multi_agent_no_compaction: 2,
+    multi_agent_compaction: 3,
+    multi_agent_verified: 4,
+    debate_gap: 5,
+  };
+  return ranks[mode ?? ''] ?? 99;
+}
+
+function slugify(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 72) || 'eval-report';
+}
+
+function downloadText(filename: string, content: string) {
+  const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function readStream(
+  response: Response,
+  onEvent: (data: Record<string, unknown>) => void,
+): Promise<void> {
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() ?? '';
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      try { onEvent(JSON.parse(line.slice(6))); } catch { /* skip malformed SSE line */ }
+    }
+  }
+}
+
+function buildEvalDetailMarkdown(detail: EvalReportDetail): string {
+  const grounding = groundingRate(detail);
+  const faithfulness = faithfulnessRate(detail);
+  const lines: string[] = [];
+  const report = detail.report;
+
+  lines.push(`# Eval Report: ${detail.query}`, '');
+  lines.push(`- Run ID: ${detail.run_id}`);
+  lines.push(`- Eval report ID: ${detail.id}`);
+  lines.push(`- Generated: ${new Date(detail.generated_at).toLocaleString()}`);
+  lines.push(`- Result: ${detail.passed ? 'Passed' : 'Failed'}`);
+  lines.push(`- Eval model: ${detail.eval_model}`);
+  lines.push(`- Eval cost: ${fmtCost(detail.eval_cost_usd)}`);
+  lines.push('');
+
+  lines.push('## Metrics', '');
+  lines.push('| Metric | Value |');
+  lines.push('| --- | ---: |');
+  lines.push(`| Citation grounding | ${fmtPct(grounding)} |`);
+  lines.push(`| Citation faithfulness | ${fmtPct(faithfulness)} |`);
+  lines.push(`| Completeness / recall | ${fmtPct(detail.recall_score * 100)} |`);
+  lines.push(`| Relevance | ${fmtScore(detail.relevance_score)} |`);
+  lines.push(`| Unsupported findings | ${detail.ungrounded_count}/${detail.total_findings} |`);
+  lines.push(`| Unfaithful citations | ${detail.unfaithful_count}/${detail.total_citations} |`);
+  lines.push(`| Uncited sentences | ${detail.uncited_count} |`);
+  lines.push('');
+
+  if (detail.failure_reasons.length > 0) {
+    lines.push('## Failure Reasons', '');
+    detail.failure_reasons.forEach(reason => lines.push(`- ${reason}`));
+    lines.push('');
+  }
+
+  lines.push('## Relevance', '');
+  lines.push(`Score: ${report.relevance.score}/5`, '');
+  lines.push(report.relevance.reasoning, '');
+
+  lines.push('## Completeness', '');
+  lines.push(`Recall: ${fmtPct(report.completeness.recall_score * 100)}`, '');
+  if (report.completeness.subtopics.length === 0) {
+    lines.push('No subtopics generated.', '');
+  } else {
+    report.completeness.subtopics.forEach((s, i) => {
+      lines.push(`${i + 1}. ${s.covered ? '[covered]' : '[missing]'} ${s.subtopic}`);
+      if (s.note) lines.push(`   - ${s.note}`);
+    });
+    lines.push('');
+  }
+
+  lines.push('## Citation Grounding', '');
+  if (report.grounding_results.length === 0) {
+    lines.push('No findings to check.', '');
+  } else {
+    report.grounding_results.forEach((g, i) => {
+      lines.push(`### Finding ${i + 1}: ${g.grounded ? 'Grounded' : 'Ungrounded'}`);
+      lines.push(`- Source: ${g.citation_url}`);
+      lines.push(`- Method: ${g.method}`);
+      lines.push(`- Similarity: ${g.similarity.toFixed(2)}`);
+      if (g.note) lines.push(`- Note: ${g.note}`);
+      lines.push('');
+      lines.push('Evidence span:');
+      lines.push('```');
+      lines.push(g.evidence_span);
+      lines.push('```', '');
+    });
+  }
+
+  lines.push('## Faithfulness Verdicts', '');
+  if (report.faithfulness_results.length === 0) {
+    lines.push('No cited sentences to check.', '');
+  } else {
+    report.faithfulness_results.forEach((f, i) => {
+      lines.push(`### Citation ${i + 1}: ${f.faithful ? 'Faithful' : 'Unfaithful'}`);
+      lines.push(`- Citation index: [${f.citation_index}]`);
+      lines.push(`- Confidence: ${f.confidence.toFixed(2)}`);
+      lines.push(`- Reasoning: ${f.reasoning}`);
+      if (f.matched_finding_claims.length > 0) {
+        lines.push('- Matched finding claims:');
+        f.matched_finding_claims.forEach(claim => lines.push(`  - ${claim}`));
+      }
+      lines.push('');
+      lines.push('Report sentence:');
+      lines.push('```');
+      lines.push(f.report_sentence);
+      lines.push('```', '');
+    });
+  }
+
+  if (report.citation_coverage) {
+    lines.push('## Citation Coverage', '');
+    lines.push(`Coverage score: ${fmtPct(report.citation_coverage.coverage_score * 100)}`, '');
+    if (report.citation_coverage.uncited_factual_claims.length === 0) {
+      lines.push('No uncited factual claims were flagged.', '');
+    } else {
+      report.citation_coverage.uncited_factual_claims.forEach((issue, i) => {
+        lines.push(`${i + 1}. ${issue.sentence}`);
+        lines.push(`   - Section: ${issue.section}`);
+        lines.push(`   - Reasoning: ${issue.reasoning}`);
+      });
+      lines.push('');
+    }
+  }
+
+  lines.push('## Uncited Sentences', '');
+  if (report.uncited_sentences.length === 0) {
+    lines.push('Every sentence in the report carries a citation.', '');
+  } else {
+    report.uncited_sentences.forEach((u, i) => {
+      lines.push(`${i + 1}. ${u.sentence}`);
+      lines.push(`   - Section: ${u.section}`);
+    });
+    lines.push('');
+  }
+
+  return lines.join('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -231,154 +367,75 @@ function CrossIcon() {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Trend chart — lightweight inline SVG, no charting dependency
-// ---------------------------------------------------------------------------
-
-// Catmull-Rom to cubic-Bezier conversion (tension 1/6) — smooth curve through
-// a series of points, matching the look of typical analytics dashboards.
-function smoothLinePath(pts: { x: number; y: number }[]): string {
-  if (pts.length === 0) return '';
-  if (pts.length === 1) return `M ${pts[0].x} ${pts[0].y}`;
-  let d = `M ${pts[0].x} ${pts[0].y}`;
-  for (let i = 0; i < pts.length - 1; i++) {
-    const p0 = pts[i === 0 ? i : i - 1];
-    const p1 = pts[i];
-    const p2 = pts[i + 1];
-    const p3 = pts[i + 2 < pts.length ? i + 2 : i + 1];
-    const cp1x = p1.x + (p2.x - p0.x) / 6;
-    const cp1y = p1.y + (p2.y - p0.y) / 6;
-    const cp2x = p2.x - (p3.x - p1.x) / 6;
-    const cp2y = p2.y - (p3.y - p1.y) / 6;
-    d += ` C ${cp1x} ${cp1y}, ${cp2x} ${cp2y}, ${p2.x} ${p2.y}`;
-  }
-  return d;
-}
-
-function TrendChart({ points }: { points: CommunityTrendPoint[] }) {
-  // Measure the actual rendered width so the viewBox matches it 1:1 — with
-  // preserveAspectRatio="none", a viewBox aspect ratio that doesn't match the
-  // rendered box stretches circles into ellipses and squashes/elongates text.
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [width, setWidth] = useState(720);
+function CustomSelect({
+  options,
+  value,
+  onChange,
+  disabled = false,
+}: {
+  options: { id: string; label: string; description?: string }[];
+  value: string;
+  onChange: (id: string) => void;
+  disabled?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    const el = containerRef.current;
-    if (!el) return;
-    const observer = new ResizeObserver(entries => {
-      const w = entries[0]?.contentRect.width;
-      if (w) setWidth(w);
-    });
-    observer.observe(el);
-    return () => observer.disconnect();
+    function onPointerDown(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener('mousedown', onPointerDown);
+    return () => document.removeEventListener('mousedown', onPointerDown);
   }, []);
 
-  if (points.length === 0) {
-    return (
-      <div ref={containerRef} className="flex items-center justify-center h-48 text-sm text-gray-400">
-        No community eval data yet.
-      </div>
-    );
-  }
-
-  const W = width;
-  const H = 192; // matches h-48
-  const padL = 36;
-  const padR = 12;
-  const padT = 12;
-  const padB = 24;
-  const innerW = W - padL - padR;
-  const innerH = H - padT - padB;
-
-  const n = points.length;
-  const xFor = (i: number) => (n === 1 ? padL + innerW / 2 : padL + (i / (n - 1)) * innerW);
-
-  const groundingPts = points.map((p, i) => ({ x: xFor(i), pct: groundingRate(p) }));
-  const faithPts = points.map((p, i) => ({ x: xFor(i), pct: faithfulnessRate(p) }));
-
-  // Zoom the y-axis to the data's range (with padding) so small differences
-  // near 100% — the common case — are visible instead of a flat line pinned
-  // to the top of a fixed 0-100% scale.
-  const allPcts = [...groundingPts, ...faithPts]
-    .map(p => p.pct)
-    .filter((v): v is number => v !== null);
-  let yMin = 0;
-  let yMax = 100;
-  if (allPcts.length > 0) {
-    const dataMin = Math.min(...allPcts);
-    const dataMax = Math.max(...allPcts);
-    const pad = Math.max(dataMax - dataMin, 4) * 0.5;
-    yMin = Math.max(0, Math.floor((dataMin - pad) / 5) * 5);
-    yMax = Math.min(100, Math.ceil((dataMax + pad) / 5) * 5);
-    if (yMin === yMax) {
-      yMin = Math.max(0, yMin - 10);
-      yMax = Math.min(100, yMax + 10);
-    }
-  }
-  const yFor = (pct: number) => padT + innerH - ((pct - yMin) / (yMax - yMin)) * innerH;
-
-  const linePath = (pts: { x: number; pct: number | null }[]) =>
-    smoothLinePath(
-      pts.filter((p): p is { x: number; pct: number } => p.pct !== null)
-        .map(p => ({ x: p.x, y: yFor(p.pct) })),
-    );
-
-  const yTicks = [yMin, (yMin + yMax) / 2, yMax];
-  const xTickIdx = n === 1 ? [0] : n === 2 ? [0, 1] : [0, Math.floor((n - 1) / 2), n - 1];
+  const selected = options.find(option => option.id === value);
 
   return (
-    <div ref={containerRef}>
-      <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-48" preserveAspectRatio="none">
-        {/* gridlines + y-axis labels, zoomed to the data range */}
-        {yTicks.map(pct => (
-          <g key={pct}>
-            <line x1={padL} y1={yFor(pct)} x2={W - padR} y2={yFor(pct)} stroke="#e5e7eb" strokeWidth={1} />
-            <text x={padL - 6} y={yFor(pct) + 3} textAnchor="end" fontSize="9" fill="#9ca3af">{Math.round(pct)}%</text>
-          </g>
-        ))}
-
-        {/* grounding line (blue, smoothed) */}
-        <path d={linePath(groundingPts)} fill="none" stroke="#3b82f6" strokeWidth={2} />
-        {/* faithfulness line (amber, smoothed) */}
-        <path d={linePath(faithPts)} fill="none" stroke="#f59e0b" strokeWidth={2} />
-
-        {/* donut-style points */}
-        {points.map((p, i) => {
-          const gPct = groundingRate(p);
-          const fPct = faithfulnessRate(p);
-          return (
-            <g key={i}>
-              {gPct !== null && (
-                <circle cx={xFor(i)} cy={yFor(gPct)} r={4} fill="#fff" stroke="#3b82f6" strokeWidth={2}>
-                  <title>{`Grounding: ${gPct.toFixed(0)}% — ${fmtDate(p.generated_at)}`}</title>
-                </circle>
-              )}
-              {fPct !== null && (
-                <circle cx={xFor(i)} cy={yFor(fPct)} r={4} fill="#fff" stroke="#f59e0b" strokeWidth={2}>
-                  <title>{`Faithfulness: ${fPct.toFixed(0)}% — ${fmtDate(p.generated_at)}`}</title>
-                </circle>
-              )}
-            </g>
-          );
-        })}
-
-        {/* x-axis date labels */}
-        {xTickIdx.map(i => (
-          <text key={i} x={xFor(i)} y={H - 6} textAnchor="middle" fontSize="9" fill="#9ca3af">
-            {fmtShortDate(points[i].generated_at)}
-          </text>
-        ))}
-      </svg>
-      <div className="flex items-center gap-4 mt-2 text-[11px] text-gray-500">
-        <span className="flex items-center gap-1.5">
-          <svg width="10" height="10" className="flex-shrink-0"><circle cx="5" cy="5" r="3.5" fill="#fff" stroke="#3b82f6" strokeWidth="2" /></svg>
-          Grounding rate
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen(v => !v)}
+        disabled={disabled}
+        className="w-full flex items-center justify-between gap-2 rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 text-left text-sm text-gray-700 hover:border-gray-300 disabled:cursor-default disabled:opacity-60 focus:outline-none"
+      >
+        <span className="min-w-0">
+          <span className="block truncate font-medium">{selected?.label ?? 'Select'}</span>
+          {selected?.description && (
+            <span className="block truncate text-xs text-gray-400 mt-0.5">
+              {selected.description}
+            </span>
+          )}
         </span>
-        <span className="flex items-center gap-1.5">
-          <svg width="10" height="10" className="flex-shrink-0"><circle cx="5" cy="5" r="3.5" fill="#fff" stroke="#f59e0b" strokeWidth="2" /></svg>
-          Faithfulness rate
-        </span>
-      </div>
+        <svg className={`w-4 h-4 text-gray-400 flex-shrink-0 transition-transform ${open ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+        </svg>
+      </button>
+
+      {open && (
+        <div className="absolute z-20 mt-2 w-full min-w-[240px] max-h-72 overflow-y-auto rounded-xl border border-gray-200 bg-white shadow-lg">
+          {options.map(option => {
+            const isSelected = option.id === value;
+            return (
+              <button
+                key={option.id}
+                type="button"
+                onClick={() => { onChange(option.id); setOpen(false); }}
+                className={`w-full px-3 py-2.5 text-left transition-colors focus:outline-none ${
+                  isSelected ? 'bg-blue-50' : 'hover:bg-gray-50'
+                }`}
+              >
+                <span className={`block text-sm font-medium ${isSelected ? 'text-blue-700' : 'text-gray-800'}`}>
+                  {option.label}
+                </span>
+                {option.description && (
+                  <span className="block text-xs text-gray-400 mt-0.5">{option.description}</span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
@@ -419,11 +476,17 @@ function DetailPanel({ detail, loading }: { detail: EvalReportDetail | null; loa
           <p className="text-sm font-semibold text-gray-900 truncate">{detail.query}</p>
           <p className="text-xs text-gray-400 mt-0.5">{fmtDate(detail.generated_at)}</p>
         </div>
-        <span className={`flex-shrink-0 text-xs font-semibold px-2.5 py-1 rounded-full ${
-          detail.passed ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-red-50 text-red-600 border border-red-200'
-        }`}>
-          {detail.passed ? 'Passed' : 'Failed'}
-        </span>
+        <div className="flex flex-shrink-0 items-center gap-2">
+          <button
+            onClick={() => downloadText(
+              `${slugify(detail.query)}-eval-${new Date(detail.generated_at).toISOString().slice(0, 10)}.md`,
+              buildEvalDetailMarkdown(detail),
+            )}
+            className="text-xs font-semibold text-blue-600 hover:text-blue-800 border border-blue-100 hover:border-blue-200 bg-blue-50 rounded-lg px-2.5 py-1 transition-colors"
+          >
+            Download .md
+          </button>
+        </div>
       </div>
 
       {detail.failure_reasons.length > 0 && (
@@ -549,163 +612,28 @@ function DetailPanel({ detail, loading }: { detail: EvalReportDetail | null; loa
 }
 
 // ---------------------------------------------------------------------------
-// RAG Eval result panel
-// ---------------------------------------------------------------------------
-
-function ScoreBar({ value, color }: { value: number; color: string }) {
-  return (
-    <div className="w-full bg-gray-100 rounded-full h-1.5 mt-1.5">
-      <div className={`h-1.5 rounded-full ${color}`} style={{ width: `${Math.round(value * 100)}%` }} />
-    </div>
-  );
-}
-
-function RagEvalResultPanel({ result }: { result: RagEvalReport }) {
-  const [showAnswer, setShowAnswer] = useState(false);
-  const precisionColor = result.context_precision >= 0.8 ? 'bg-emerald-500' : result.context_precision >= 0.5 ? 'bg-amber-400' : 'bg-red-400';
-  const faithColor = result.answer_faithfulness >= 0.8 ? 'bg-emerald-500' : result.answer_faithfulness >= 0.5 ? 'bg-amber-400' : 'bg-red-400';
-  const relevanceColor = result.answer_relevance >= 0.8 ? 'bg-emerald-500' : result.answer_relevance >= 0.5 ? 'bg-amber-400' : 'bg-red-400';
-
-  return (
-    <div className="space-y-4 pt-2 border-t border-gray-100">
-      {/* Score cards */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        <div className="bg-gray-50 border border-gray-200 rounded-xl px-4 py-3">
-          <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold">Context Precision</p>
-          <p className="text-2xl font-bold text-gray-900 mt-1">{fmtPct(result.context_precision * 100)}</p>
-          <ScoreBar value={result.context_precision} color={precisionColor} />
-          <p className="text-[10px] text-gray-400 mt-1.5">
-            {result.chunk_verdicts.filter(v => v.relevant).length}/{result.chunk_verdicts.length} chunks relevant
-          </p>
-        </div>
-        <div className="bg-gray-50 border border-gray-200 rounded-xl px-4 py-3">
-          <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold">Context Sufficiency</p>
-          <p className="text-2xl font-bold text-gray-900 mt-1">{fmtPct(result.context_sufficiency * 100)}</p>
-          <ScoreBar value={result.context_sufficiency} color={result.context_sufficiency >= 1 ? 'bg-emerald-500' : 'bg-red-400'} />
-          <p className="text-[10px] text-gray-400 mt-1.5 line-clamp-2">
-            {result.context_sufficiency_verdict.reasoning}
-          </p>
-        </div>
-        <div className="bg-gray-50 border border-gray-200 rounded-xl px-4 py-3">
-          <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold">Answer Faithfulness</p>
-          <p className="text-2xl font-bold text-gray-900 mt-1">{fmtPct(result.answer_faithfulness * 100)}</p>
-          <ScoreBar value={result.answer_faithfulness} color={faithColor} />
-          <p className="text-[10px] text-gray-400 mt-1.5">
-            {result.claim_verdicts.filter(v => v.supported).length}/{result.claim_verdicts.length} claims supported
-          </p>
-        </div>
-        <div className="bg-gray-50 border border-gray-200 rounded-xl px-4 py-3">
-          <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold">Answer Relevance</p>
-          <p className="text-2xl font-bold text-gray-900 mt-1">{fmtPct(result.answer_relevance * 100)}</p>
-          <ScoreBar value={result.answer_relevance} color={relevanceColor} />
-          <p className="text-[10px] text-gray-400 mt-1.5 line-clamp-2">
-            {result.answer_relevance_verdict.reasoning}
-          </p>
-        </div>
-      </div>
-
-      {/* Meta row */}
-      <div className="flex items-center gap-3 text-[11px] text-gray-400 flex-wrap">
-        <span>{result.selected_reports.length} report(s) selected · {result.chunks_retrieved} chunk(s) retrieved</span>
-        <span>·</span>
-        <span>{fmtCost(result.eval_cost_usd)} eval cost</span>
-        <span>·</span>
-        <span>{result.eval_model}</span>
-      </div>
-
-      {/* Chunk verdicts */}
-      {result.chunk_verdicts.length > 0 && (
-        <div>
-          <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-1.5">
-            Retrieved Chunks
-          </p>
-          <div className="space-y-1.5">
-            {result.chunk_verdicts.map((v, i) => (
-              <div key={i} className="flex items-start gap-2 bg-white border border-gray-200 rounded-lg px-3 py-2">
-                {v.relevant ? <CheckIcon /> : <CrossIcon />}
-                <div className="min-w-0 flex-1">
-                  <p className="text-xs font-medium text-gray-700">
-                    {v.title}{v.section && v.section !== '/' ? <span className="text-gray-400 font-normal"> · {v.section}</span> : null}
-                  </p>
-                  <p className="text-[11px] text-gray-500 mt-0.5 line-clamp-2">{v.preview}</p>
-                  {!v.relevant && <p className="text-[10px] text-red-500 mt-0.5">{v.reasoning}</p>}
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Claim verdicts */}
-      {result.claim_verdicts.length > 0 && (
-        <div>
-          <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-1.5">
-            Answer Claims
-          </p>
-          <div className="space-y-1.5">
-            {result.claim_verdicts.map((v, i) => (
-              <div key={i} className="flex items-start gap-2 bg-white border border-gray-200 rounded-lg px-3 py-2">
-                {v.supported ? <CheckIcon /> : <CrossIcon />}
-                <div className="min-w-0 flex-1">
-                  <p className="text-xs text-gray-700">{v.claim}</p>
-                  {!v.supported && <p className="text-[10px] text-red-500 mt-0.5">{v.reasoning}</p>}
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Generated answer (collapsible) */}
-      {result.answer && (
-        <div>
-          <button
-            onClick={() => setShowAnswer(a => !a)}
-            className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold hover:text-gray-600 transition-colors"
-          >
-            {showAnswer ? '▾' : '▸'} Generated Answer
-          </button>
-          {showAnswer && (
-            <div className="mt-1.5 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2">
-              <p className="text-xs text-gray-700 whitespace-pre-wrap">{result.answer}</p>
-            </div>
-          )}
-        </div>
-      )}
-
-      {result.chunks_retrieved === 0 && (
-        <p className="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-          No chunks were retrieved. Try re-indexing the library or asking a question covered by your research reports.
-        </p>
-      )}
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // Main dashboard
 // ---------------------------------------------------------------------------
 
 export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; clientId: string }) {
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [reports, setReports] = useState<EvalReportSummary[]>([]);
-  const [communityTrend, setCommunityTrend] = useState<CommunityTrendPoint[]>([]);
+  const [modelOptions, setModelOptions] = useState<ModelOption[]>([
+    { id: 'gpt-5.4', label: 'GPT-5.4', description: 'Best for complex topics' },
+  ]);
   const [loading, setLoading] = useState(true);
   const [errorMsg, setErrorMsg] = useState('');
   const [runningEvalFor, setRunningEvalFor] = useState<string | null>(null);
   const [selectedReportId, setSelectedReportId] = useState<string | null>(null);
+  const [selectedRunId, setSelectedRunId] = useState('');
   const [detail, setDetail] = useState<EvalReportDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
-
-  // RAG eval state
-  const [ragQuestion, setRagQuestion] = useState('');
-  const [ragEvalLoading, setRagEvalLoading] = useState(false);
-  const [ragEvalResult, setRagEvalResult] = useState<RagEvalReport | null>(null);
-
-  // Re-index state
-  const [reindexing, setReindexing] = useState(false);
-  const [reindexResult, setReindexResult] = useState<{ indexed: number; total: number; failed: {run_id: string; reason: string}[] } | null>(null);
+  const [activeTab, setActiveTab] = useState<'evaluate' | 'benchmark'>('evaluate');
+  const [benchmarkQuestions, setBenchmarkQuestions] = useState('');
+  const [benchmarkRunning, setBenchmarkRunning] = useState(false);
+  const [benchmarkProgress, setBenchmarkProgress] = useState('');
+  const detailRef = useRef<HTMLDivElement>(null);
 
   // Custom confirmation modal (replaces window.confirm for destructive actions)
   const [confirmDialog, setConfirmDialog] = useState<{
@@ -715,18 +643,24 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
     onConfirm: () => void;
   } | null>(null);
 
-  // Model used to judge faithfulness/completeness/relevance for "Run Eval".
-  // Fixed (not user-selectable) so every eval — including ones aggregated into
-  // "Community Average" and the trend chart below — is judged consistently.
-  // Defaults to a different provider than the report's writer model (see
-  // engine/models.py EVAL_MODEL) so the judge isn't grading its own work.
+  // Default model used to judge faithfulness/completeness/relevance. The UI
+  // displays it in benchmark mode but does not vary it per row, so the
+  // comparison stays apples-to-apples.
   const [evalModel, setEvalModel] = useState('claude-haiku-4-5');
+  const [researchModel, setResearchModel] = useState('gpt-5.4');
+  const [advocateModel, setAdvocateModel] = useState('claude-sonnet-4-6');
+  const [skepticModel, setSkepticModel] = useState('gemini-3.1-pro-preview');
 
   useEffect(() => {
     fetch(`${apiBase}/models`)
       .then(res => res.json())
-      .then((data: { defaults?: { eval?: string } }) => {
+      .then((data: ModelsResponse) => {
+        if (data.options?.length) setModelOptions(data.options);
+        if (data.default) setResearchModel(data.default);
+        if (data.defaults?.lead) setResearchModel(data.defaults.lead);
         if (data.defaults?.eval) setEvalModel(data.defaults.eval);
+        if (data.defaults?.advocate) setAdvocateModel(data.defaults.advocate);
+        if (data.defaults?.skeptic) setSkepticModel(data.defaults.skeptic);
       })
       .catch(() => { /* keep the hardcoded fallback */ });
   }, [apiBase]);
@@ -737,15 +671,13 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
     setLoading(true);
     setErrorMsg('');
     try {
-      const [runsRes, reportsRes, trendRes] = await Promise.all([
-        fetch(`${apiBase}/runs?status=done`, { headers }),
+      const [runsRes, reportsRes] = await Promise.all([
+        fetch(`${apiBase}/runs?status=done&mine=true`, { headers }),
         fetch(`${apiBase}/eval/reports`, { headers }),
-        fetch(`${apiBase}/eval/reports/community`),
       ]);
-      if (!runsRes.ok || !reportsRes.ok || !trendRes.ok) throw new Error('Failed to load eval data');
+      if (!runsRes.ok || !reportsRes.ok) throw new Error('Failed to load eval data');
       setRuns(await runsRes.json());
       setReports(await reportsRes.json());
-      setCommunityTrend(await trendRes.json());
     } catch (e) {
       setErrorMsg(String(e));
     } finally {
@@ -755,7 +687,11 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
 
   useEffect(() => { load(); }, [load]);
 
-  // Most recent eval report per run_id, for the runs table's status badge.
+  useEffect(() => {
+    if (!selectedRunId && runs.length > 0) setSelectedRunId(runs[0].id);
+  }, [runs, selectedRunId]);
+
+  // Most recent eval report per run_id, for quick view/evaluate actions.
   const latestByRun = useMemo(() => {
     const map = new Map<string, EvalReportSummary>();
     for (const r of reports) {
@@ -765,34 +701,82 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
     return map;
   }, [reports]);
 
-  const summary = useMemo(() => {
-    if (reports.length === 0) return null;
-    const passed = reports.filter(r => r.passed).length;
-    const totalFindings = reports.reduce((s, r) => s + r.total_findings, 0);
-    const ungrounded = reports.reduce((s, r) => s + r.ungrounded_count, 0);
-    const totalCitations = reports.reduce((s, r) => s + r.total_citations, 0);
-    const unfaithful = reports.reduce((s, r) => s + r.unfaithful_count, 0);
-    const totalRecall = reports.reduce((s, r) => s + r.recall_score, 0);
-    const totalRelevance = reports.reduce((s, r) => s + r.relevance_score, 0);
-    const totalCost = reports.reduce((s, r) => s + r.eval_cost_usd, 0);
-    return {
-      runsEvaluated: reports.length,
-      passRate: (passed / reports.length) * 100,
-      groundingRate: totalFindings === 0 ? null : ((totalFindings - ungrounded) / totalFindings) * 100,
-      faithfulnessRate: totalCitations === 0 ? null : ((totalCitations - unfaithful) / totalCitations) * 100,
-      completenessRate: (totalRecall / reports.length) * 100,
-      relevanceScore: totalRelevance / reports.length,
-      totalCost,
-    };
-  }, [reports]);
+  const benchmarkRows = useMemo(() => {
+    const runsById = new Map(runs.map(run => [run.id, run]));
+    const grouped = new Map<string, { reports: EvalReportSummary[]; runs: RunSummary[] }>();
+    for (const report of reports) {
+      const run = runsById.get(report.run_id);
+      const mode = run?.stats?.mode ?? 'unknown';
+      if (mode === 'unknown') continue;
+      const group = grouped.get(mode) ?? { reports: [], runs: [] };
+      group.reports.push(report);
+      if (run) group.runs.push(run);
+      grouped.set(mode, group);
+    }
+
+    return [...grouped.entries()]
+      .map(([mode, group]) => {
+        const reportCount = group.reports.length;
+        const totalFindings = group.reports.reduce((s, r) => s + r.total_findings, 0);
+        const ungrounded = group.reports.reduce((s, r) => s + r.ungrounded_count, 0);
+        const totalCitations = group.reports.reduce((s, r) => s + r.total_citations, 0);
+        const unfaithful = group.reports.reduce((s, r) => s + r.unfaithful_count, 0);
+        const totalRecall = group.reports.reduce((s, r) => s + r.recall_score, 0);
+        const totalRelevance = group.reports.reduce((s, r) => s + r.relevance_score, 0);
+        const totalCost = group.runs.reduce((s, r) => s + (r.stats?.cost_usd ?? 0), 0);
+        const totalLatency = group.runs.reduce((s, r) => s + (r.stats?.elapsed_seconds ?? 0), 0);
+        return {
+          mode,
+          reports: reportCount,
+          grounding: totalFindings === 0 ? null : ((totalFindings - ungrounded) / totalFindings) * 100,
+          faithfulness: totalCitations === 0 ? null : ((totalCitations - unfaithful) / totalCitations) * 100,
+          completeness: reportCount === 0 ? null : (totalRecall / reportCount) * 100,
+          relevance: reportCount === 0 ? null : totalRelevance / reportCount,
+          avgCost: group.runs.length === 0 ? undefined : totalCost / group.runs.length,
+          avgLatency: group.runs.length === 0 ? undefined : totalLatency / group.runs.length,
+        };
+      })
+      .sort((a, b) => modeRank(a.mode) - modeRank(b.mode));
+  }, [reports, runs]);
+
+  const selectedRun = useMemo(
+    () => runs.find(run => run.id === selectedRunId) ?? runs[0],
+    [runs, selectedRunId],
+  );
+  const selectedRunEval = selectedRun ? latestByRun.get(selectedRun.id) : undefined;
+  const runOptions = useMemo(
+    () => runs.map(run => ({
+      id: run.id,
+      label: run.title || run.query || 'Untitled research',
+      description: `${modeLabel(run.stats?.mode)} · ${fmtDate(run.started_at)} · ${fmtCost(run.stats?.cost_usd)}`,
+    })),
+    [runs],
+  );
+
+  function downloadBenchmarkMarkdown() {
+    const lines = [
+      '| Mode | Runs | Grounding | Faithfulness | Completeness | Relevance | Avg Cost | Avg Latency |',
+      '|---|---:|---:|---:|---:|---:|---:|---:|',
+      ...benchmarkRows.map(row => (
+        `| ${modeLabel(row.mode)} | ${row.reports} | ${fmtPct(row.grounding)} | `
+        + `${fmtPct(row.faithfulness)} | `
+        + `${fmtPct(row.completeness)} | ${fmtScore(row.relevance)} | `
+        + `${fmtCost(row.avgCost)} | `
+        + `${row.avgLatency === undefined ? '—' : `${row.avgLatency.toFixed(1)}s`} |`
+      )),
+    ];
+    downloadText('benchmark-ablation-table.md', lines.join('\n') + '\n');
+  }
 
   const loadDetail = useCallback(async (reportId: string) => {
+    setActiveTab('evaluate');
     setSelectedReportId(reportId);
     setDetailLoading(true);
     try {
       const res = await fetch(`${apiBase}/eval/reports/${reportId}`, { headers });
       if (!res.ok) throw new Error('Failed to load report detail');
       setDetail(await res.json());
+      setTimeout(() => detailRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
     } catch (e) {
       setErrorMsg(String(e));
     } finally {
@@ -823,6 +807,77 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
     }
   }
 
+  async function startResearchRun(
+    query: string,
+    mode: string,
+    debate: boolean,
+  ): Promise<string> {
+    const res = await fetch(`${apiBase}/research`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...headers },
+      body: JSON.stringify({
+        query,
+        mode,
+        debate,
+        model: researchModel || undefined,
+        advocate_model: debate ? advocateModel || undefined : undefined,
+        skeptic_model: debate ? skepticModel || undefined : undefined,
+      }),
+    });
+    if (!res.ok) throw new Error(`Research failed: HTTP ${res.status}`);
+
+    let runId = '';
+    await readStream(res, data => {
+      if (data.type === 'started') runId = data.run_id as string;
+      if (data.type === 'error') throw new Error(data.message as string);
+      if (data.type === 'done') runId = data.run_id as string;
+    });
+    if (!runId) throw new Error('Research stream ended without a run id');
+    return runId;
+  }
+
+  async function runBenchmark() {
+    const questions = benchmarkQuestions
+      .split('\n')
+      .map(q => q.trim())
+      .filter(Boolean);
+    if (questions.length === 0 || benchmarkRunning) return;
+
+    const modes = [
+      { label: 'L1 Single Agent', mode: 'single_agent', debate: false },
+      { label: 'L2 Multi-Agent', mode: 'multi_agent_no_compaction', debate: false },
+      { label: 'L3 Compacted', mode: 'multi_agent_compaction', debate: false },
+      { label: 'L4 Citation Checked', mode: 'multi_agent_verified', debate: false },
+      { label: 'L5 Debate + Gap', mode: 'multi_agent_verified', debate: true },
+    ];
+    const total = questions.length * modes.length;
+    let done = 0;
+
+    setBenchmarkRunning(true);
+    setErrorMsg('');
+    try {
+      for (const question of questions) {
+        for (const mode of modes) {
+          setBenchmarkProgress(`${done + 1}/${total} · ${mode.label}`);
+          const runId = await startResearchRun(question, mode.mode, mode.debate);
+          const evalRes = await fetch(
+            `${apiBase}/runs/${runId}/eval?model=${encodeURIComponent(evalModel)}`,
+            { method: 'POST', headers },
+          );
+          if (!evalRes.ok) throw new Error(`Eval failed: HTTP ${evalRes.status}`);
+          done += 1;
+        }
+      }
+      setBenchmarkProgress(`Complete · ${done}/${total} runs evaluated`);
+      await load();
+      setActiveTab('benchmark');
+    } catch (e) {
+      setErrorMsg(String(e));
+    } finally {
+      setBenchmarkRunning(false);
+    }
+  }
+
   async function deleteRun(runId: string) {
     setDeletingRunId(runId);
     setErrorMsg('');
@@ -850,44 +905,6 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
     });
   }
 
-  async function runRagEval() {
-    if (!ragQuestion.trim()) return;
-    setRagEvalLoading(true);
-    setRagEvalResult(null);
-    setErrorMsg('');
-    try {
-      const res = await fetch(`${apiBase}/library/eval`, {
-        method: 'POST',
-        headers: { ...headers, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question: ragQuestion, eval_model: evalModel }),
-      });
-      if (!res.ok) {
-        const body = await res.json().catch(() => null);
-        throw new Error(body?.detail ?? `HTTP ${res.status}`);
-      }
-      setRagEvalResult(await res.json());
-    } catch (e) {
-      setErrorMsg(String(e));
-    } finally {
-      setRagEvalLoading(false);
-    }
-  }
-
-  async function reindexLibrary() {
-    setReindexing(true);
-    setReindexResult(null);
-    setErrorMsg('');
-    try {
-      const res = await fetch(`${apiBase}/library/reindex`, { method: 'POST', headers });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      setReindexResult(await res.json());
-    } catch (e) {
-      setErrorMsg(String(e));
-    } finally {
-      setReindexing(false);
-    }
-  }
-
   return (
     <div className="flex-1 overflow-y-auto">
     <div className="p-4 sm:p-6 space-y-6 max-w-5xl mx-auto w-full">
@@ -907,57 +924,279 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
         </p>
       )}
 
+      <div className="inline-flex rounded-xl border border-gray-200 bg-white p-1 shadow-sm">
+        {[
+          ['evaluate', 'Evaluate Reports'],
+          ['benchmark', 'Compare Modes'],
+        ].map(([id, label]) => (
+          <button
+            key={id}
+            onClick={() => setActiveTab(id as 'evaluate' | 'benchmark')}
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
+              activeTab === id ? 'bg-gray-900 text-white' : 'text-gray-500 hover:text-gray-800'
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
       {loading ? (
         <div className="flex items-center justify-center h-32 text-sm text-gray-400 gap-2">
           <Spinner /> Loading…
         </div>
       ) : (
         <>
-          {/* Stats */}
-          <div>
-            <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-2">Stats</p>
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-              <div className="bg-white border border-gray-200 rounded-xl shadow-sm px-4 py-3">
-                <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold">Runs Evaluated</p>
-                <p className="text-2xl font-bold text-gray-900 mt-1">{summary?.runsEvaluated ?? 0}</p>
+          {activeTab === 'benchmark' && (
+            <>
+            <div className="bg-white border border-gray-200 rounded-2xl shadow-sm p-4">
+              <div className="flex items-start justify-between gap-3 flex-wrap">
+                <div>
+                  <p className="text-sm font-semibold text-gray-900">Run Mode Comparison</p>
+                  <p className="text-xs text-gray-400 mt-0.5">
+                    Runs each question through five quality levels, then evaluates every result.
+                  </p>
+                </div>
+                <button
+                  onClick={runBenchmark}
+                  disabled={benchmarkRunning || !benchmarkQuestions.trim()}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-gray-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-gray-800 disabled:opacity-50 disabled:cursor-default transition-colors"
+                >
+                  {benchmarkRunning && <Spinner />}
+                  {benchmarkRunning ? 'Running…' : 'Run L1-L5'}
+                </button>
               </div>
-              <div className="bg-white border border-gray-200 rounded-xl shadow-sm px-4 py-3">
-                <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold">Pass Rate</p>
-                <p className="text-2xl font-bold text-gray-900 mt-1">{summary ? fmtPct(summary.passRate) : '—'}</p>
+
+              <div className="grid gap-2 sm:grid-cols-5 mt-4">
+                {[
+                  ['L1', 'Single agent baseline'],
+                  ['L2', 'Parallel agents'],
+                  ['L3', 'Adds compaction'],
+                  ['L4', 'Adds citation check'],
+                  ['L5', 'Adds debate + gap research'],
+                ].map(([level, text]) => (
+                  <div key={level} className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-2">
+                    <p className="text-xs font-bold text-gray-900">{level}</p>
+                    <p className="text-[11px] text-gray-500 mt-0.5 leading-snug">{text}</p>
+                  </div>
+                ))}
               </div>
-              <div className="bg-white border border-gray-200 rounded-xl shadow-sm px-4 py-3">
-                <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold">Grounding Rate</p>
-                <p className="text-2xl font-bold text-gray-900 mt-1">{summary ? fmtPct(summary.groundingRate) : '—'}</p>
+
+              <div className="grid gap-4 lg:grid-cols-[1fr_260px] mt-4">
+                <div>
+                  <textarea
+                    value={benchmarkQuestions}
+                    onChange={e => setBenchmarkQuestions(e.target.value)}
+                    disabled={benchmarkRunning}
+                    rows={5}
+                    placeholder="Add one benchmark question per line..."
+                    className="w-full rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-700 focus:outline-none disabled:opacity-60"
+                  />
+                  <div className="flex flex-wrap gap-2 mt-2">
+                    {[
+                      'How is Singapore regulating AI governance and model risk in 2026?',
+                      'What obligations does the EU AI Act create for high-risk AI systems?',
+                      'How are the US, EU, and UK regulating frontier AI models?',
+                    ].map(question => (
+                      <button
+                        key={question}
+                        type="button"
+                        onClick={() => setBenchmarkQuestions(prev =>
+                          prev.includes(question)
+                            ? prev
+                            : `${prev}${prev.trim() ? '\n' : ''}${question}`,
+                        )}
+                        disabled={benchmarkRunning}
+                        className="rounded-full border border-gray-200 bg-white px-3 py-1.5 text-xs text-gray-600 hover:border-blue-300 hover:text-blue-600 disabled:opacity-50 transition-colors"
+                      >
+                        {question}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="space-y-3">
+                  <div>
+                    <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-1">
+                      Research Model
+                    </p>
+                    <CustomSelect
+                      options={modelOptions}
+                      value={researchModel}
+                      onChange={setResearchModel}
+                      disabled={benchmarkRunning}
+                    />
+                  </div>
+                  <div>
+                    <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-1">
+                      L5 Advocate
+                    </p>
+                    <CustomSelect
+                      options={modelOptions}
+                      value={advocateModel}
+                      onChange={setAdvocateModel}
+                      disabled={benchmarkRunning}
+                    />
+                  </div>
+                  <div>
+                    <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-1">
+                      L5 Skeptic
+                    </p>
+                    <CustomSelect
+                      options={modelOptions}
+                      value={skepticModel}
+                      onChange={setSkepticModel}
+                      disabled={benchmarkRunning}
+                    />
+                  </div>
+                  <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-2">
+                    <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold">
+                      Eval Judge
+                    </p>
+                    <p className="text-sm font-medium text-gray-700 mt-0.5">
+                      {modelOptions.find(model => model.id === evalModel)?.label ?? evalModel}
+                    </p>
+                  </div>
+                </div>
               </div>
-              <div className="bg-white border border-gray-200 rounded-xl shadow-sm px-4 py-3">
-                <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold">Faithfulness Rate</p>
-                <p className="text-2xl font-bold text-gray-900 mt-1">{summary ? fmtPct(summary.faithfulnessRate) : '—'}</p>
+              {benchmarkProgress && (
+                <p className="mt-3 text-xs font-medium text-gray-500">{benchmarkProgress}</p>
+              )}
+            </div>
+
+            <div className="bg-white border border-gray-200 rounded-2xl shadow-sm overflow-hidden">
+              <div className="px-4 pt-4 pb-3 border-b border-gray-100 flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-sm font-semibold text-gray-900">Mode Comparison Results</p>
+                  <p className="text-xs text-gray-400 mt-0.5">
+                    Averages across your evaluated runs, grouped by the mode stored at run completion.
+                  </p>
+                </div>
+                {benchmarkRows.length > 0 && (
+                  <button
+                    onClick={downloadBenchmarkMarkdown}
+                    className="text-xs font-semibold text-blue-600 hover:text-blue-800 border border-blue-100 hover:border-blue-200 bg-blue-50 rounded-lg px-2.5 py-1 transition-colors whitespace-nowrap"
+                  >
+                    Download .md
+                  </button>
+                )}
               </div>
-              <div className="bg-white border border-gray-200 rounded-xl shadow-sm px-4 py-3">
-                <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold">Completeness</p>
-                <p className="text-2xl font-bold text-gray-900 mt-1">{summary ? fmtPct(summary.completenessRate) : '—'}</p>
-              </div>
-              <div className="bg-white border border-gray-200 rounded-xl shadow-sm px-4 py-3">
-                <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold">Relevance</p>
-                <p className="text-2xl font-bold text-gray-900 mt-1">{summary ? fmtScore(summary.relevanceScore) : '—'}</p>
-              </div>
-              <div className="bg-white border border-gray-200 rounded-xl shadow-sm px-4 py-3">
-                <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold">Eval Cost</p>
-                <p className="text-2xl font-bold text-gray-900 mt-1">{summary ? fmtCost(summary.totalCost) : '—'}</p>
+              {benchmarkRows.length === 0 ? (
+                <p className="text-sm text-gray-400 px-4 py-4">
+                  Run and evaluate at least one research task to populate the benchmark table.
+                </p>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold border-b border-gray-200">
+                        <th className="text-left px-4 py-2 font-semibold">Mode</th>
+                        <th className="text-right px-4 py-2 font-semibold">Runs</th>
+                        <th className="text-right px-4 py-2 font-semibold">Grounding</th>
+                        <th className="text-right px-4 py-2 font-semibold">Faithfulness</th>
+                        <th className="text-right px-4 py-2 font-semibold">Completeness</th>
+                        <th className="text-right px-4 py-2 font-semibold">Relevance</th>
+                        <th className="text-right px-4 py-2 font-semibold">Avg Cost</th>
+                        <th className="text-right px-4 py-2 font-semibold">Avg Latency</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {benchmarkRows.map(row => (
+                        <tr key={row.mode} className="border-b border-gray-100 last:border-0">
+                          <td className="px-4 py-2.5 font-semibold text-gray-800 whitespace-nowrap">
+                            {modeLabel(row.mode)}
+                          </td>
+                          <td className="px-4 py-2.5 text-right text-gray-500">{row.reports}</td>
+                          <td className="px-4 py-2.5 text-right text-gray-500">{fmtPct(row.grounding)}</td>
+                          <td className="px-4 py-2.5 text-right text-gray-500">{fmtPct(row.faithfulness)}</td>
+                          <td className="px-4 py-2.5 text-right text-gray-500">{fmtPct(row.completeness)}</td>
+                          <td className="px-4 py-2.5 text-right text-gray-500">{fmtScore(row.relevance)}</td>
+                          <td className="px-4 py-2.5 text-right text-gray-500">{fmtCost(row.avgCost)}</td>
+                          <td className="px-4 py-2.5 text-right text-gray-500">
+                            {row.avgLatency === undefined ? '—' : `${row.avgLatency.toFixed(1)}s`}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+            </>
+          )}
+
+          {/* Evaluate reports */}
+          {activeTab === 'evaluate' && (
+          <>
+          <div className="bg-white border border-gray-200 rounded-2xl shadow-sm p-4">
+            <p className="text-sm font-semibold text-gray-900">Evaluate a Report</p>
+            <div className="mt-3 grid gap-3 lg:grid-cols-[1fr_auto]">
+              <CustomSelect
+                options={runOptions.length ? runOptions : [{
+                  id: '',
+                  label: 'No completed runs yet',
+                  description: 'Start a research run first',
+                }]}
+                value={selectedRun?.id ?? ''}
+                onChange={setSelectedRunId}
+                disabled={runs.length === 0}
+              />
+              <div className="flex items-center gap-2 justify-end">
+                {selectedRunEval ? (
+                  <button
+                    onClick={() => loadDetail(selectedRunEval.id)}
+                    className="rounded-lg bg-blue-600 px-3 py-2 text-xs font-semibold text-white hover:bg-blue-700 transition-colors"
+                  >
+                    View Eval
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => selectedRun && runEval(selectedRun.id)}
+                    disabled={!selectedRun || runningEvalFor === selectedRun?.id}
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 px-3 py-2 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-default transition-colors"
+                  >
+                    {runningEvalFor === selectedRun?.id && <Spinner />}
+                    {runningEvalFor === selectedRun?.id ? 'Running…' : 'Run Eval'}
+                  </button>
+                )}
+                {selectedRun && (
+                  <button
+                    onClick={() => confirmDeleteRun(selectedRun.id)}
+                    disabled={deletingRunId === selectedRun.id}
+                    className="rounded-lg border border-gray-200 px-3 py-2 text-xs font-semibold text-gray-500 hover:text-red-600 disabled:opacity-50 transition-colors"
+                  >
+                    Delete
+                  </button>
+                )}
               </div>
             </div>
+            {selectedRun && (
+              <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-gray-400">
+                <span>{modeLabel(selectedRun.stats?.mode)}</span>
+                <span>{fmtDate(selectedRun.started_at)}</span>
+                <span>{fmtCost(selectedRun.stats?.cost_usd)}</span>
+                <span>{selectedRun.stats?.elapsed_seconds !== undefined ? `${selectedRun.stats.elapsed_seconds}s` : '—'}</span>
+              </div>
+            )}
+            {selectedRunEval && (
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-4">
+                {[
+                  ['Grounding', fmtPct(groundingRate(selectedRunEval))],
+                  ['Faithfulness', fmtPct(faithfulnessRate(selectedRunEval))],
+                  ['Completeness', fmtPct(selectedRunEval.recall_score * 100)],
+                  ['Relevance', fmtScore(selectedRunEval.relevance_score)],
+                ].map(([label, value]) => (
+                  <div key={label} className="bg-gray-50 border border-gray-200 rounded-xl px-3 py-2">
+                    <p className="text-[10px] uppercase tracking-wide text-gray-400 font-semibold">
+                      {label}
+                    </p>
+                    <p className="text-base font-bold text-gray-900 mt-0.5">{value}</p>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
 
-          {/* Trend chart */}
-          <div className="bg-white border border-gray-200 rounded-2xl shadow-sm p-4">
-            <p className="text-sm font-semibold text-gray-900 mb-2">
-              Quality Over Time
-              <span className="normal-case text-gray-400 font-normal text-xs"> — across all visitors</span>
-            </p>
-            <TrendChart points={communityTrend} />
-          </div>
-
-          {/* Runs table */}
           <div className="bg-white border border-gray-200 rounded-2xl shadow-sm overflow-hidden">
             <p className="text-sm font-semibold text-gray-900 px-4 pt-4 pb-2">Recent Research</p>
             {runs.length === 0 ? (
@@ -968,11 +1207,11 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
                   <thead>
                     <tr className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold border-b border-gray-200">
                       <th className="text-left px-4 py-2 font-semibold">Query</th>
+                      <th className="text-left px-4 py-2 font-semibold">Mode</th>
                       <th className="text-left px-4 py-2 font-semibold">Started</th>
                       <th className="text-right px-4 py-2 font-semibold">Cost</th>
                       <th className="text-right px-4 py-2 font-semibold">Tokens</th>
                       <th className="text-right px-4 py-2 font-semibold">Elapsed</th>
-                      <th className="text-left px-4 py-2 font-semibold">Eval</th>
                       <th className="px-4 py-2"></th>
                     </tr>
                   </thead>
@@ -985,21 +1224,13 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
                           <td className="px-4 py-2.5 max-w-[260px]">
                             <p className="truncate text-gray-800">{run.query || 'Untitled research'}</p>
                           </td>
+                          <td className="px-4 py-2.5 text-gray-500 whitespace-nowrap">
+                            {modeLabel(run.stats?.mode)}
+                          </td>
                           <td className="px-4 py-2.5 text-gray-500 whitespace-nowrap">{fmtDate(run.started_at)}</td>
                           <td className="px-4 py-2.5 text-right text-gray-500 whitespace-nowrap">{fmtCost(run.stats?.cost_usd)}</td>
                           <td className="px-4 py-2.5 text-right text-gray-500 whitespace-nowrap">{run.stats?.total_tokens?.toLocaleString() ?? '—'}</td>
                           <td className="px-4 py-2.5 text-right text-gray-500 whitespace-nowrap">{run.stats?.elapsed_seconds !== undefined ? `${run.stats.elapsed_seconds}s` : '—'}</td>
-                          <td className="px-4 py-2.5 whitespace-nowrap">
-                            {latest ? (
-                              <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${
-                                latest.passed ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-red-50 text-red-600 border border-red-200'
-                              }`}>
-                                {latest.passed ? 'Passed' : 'Failed'}
-                              </span>
-                            ) : (
-                              <span className="text-xs text-gray-400">Not evaluated</span>
-                            )}
-                          </td>
                           <td className="px-4 py-2.5 text-right whitespace-nowrap">
                             <div className="flex items-center justify-end gap-3">
                               {latest ? (
@@ -1036,60 +1267,17 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
               </div>
             )}
           </div>
+          </>
+          )}
 
           {/* Detail panel */}
-          <div className="bg-white border border-gray-200 rounded-2xl shadow-sm p-4">
+          {activeTab === 'evaluate' && (
+          <div ref={detailRef} className="bg-white border border-gray-200 rounded-2xl shadow-sm p-4">
             <p className="text-sm font-semibold text-gray-900 mb-3">Report Detail</p>
             <DetailPanel detail={detail} loading={detailLoading} />
           </div>
+          )}
 
-          {/* RAG Eval */}
-          <div className="bg-white border border-gray-200 rounded-2xl shadow-sm p-4 space-y-4">
-            <div className="flex items-start justify-between gap-3 flex-wrap">
-              <div>
-                <p className="text-sm font-semibold text-gray-900">Research Library RAG Eval</p>
-                <p className="text-xs text-gray-400 mt-0.5">
-                  Evaluates retrieval precision and answer faithfulness for any question.
-                </p>
-              </div>
-              <div className="flex flex-col items-end gap-1">
-                <button
-                  onClick={reindexLibrary}
-                  disabled={reindexing}
-                  className="inline-flex items-center gap-1.5 text-xs font-semibold text-gray-600 hover:text-gray-900 border border-gray-200 hover:border-gray-300 px-3 py-1.5 rounded-lg disabled:opacity-50 transition-colors"
-                >
-                  {reindexing && <Spinner />}
-                  {reindexing ? 'Re-indexing…' : 'Re-index Library'}
-                </button>
-                {reindexResult && (
-                  <p className="text-[11px] text-gray-500">
-                    Indexed {reindexResult.indexed}/{reindexResult.total} runs
-                    {reindexResult.failed.length > 0 && ` · ${reindexResult.failed.length} failed`}
-                  </p>
-                )}
-              </div>
-            </div>
-
-            <div className="flex gap-2">
-              <input
-                value={ragQuestion}
-                onChange={e => setRagQuestion(e.target.value)}
-                onKeyDown={e => e.key === 'Enter' && !ragEvalLoading && runRagEval()}
-                placeholder="Ask a question to evaluate retrieval quality…"
-                className="flex-1 text-sm border border-gray-200 rounded-lg px-3 py-2 outline-none focus:ring-2 focus:ring-blue-100 focus:border-blue-400 transition"
-              />
-              <button
-                onClick={runRagEval}
-                disabled={ragEvalLoading || !ragQuestion.trim()}
-                className="inline-flex items-center gap-1.5 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg disabled:opacity-50 transition-colors whitespace-nowrap"
-              >
-                {ragEvalLoading && <Spinner />}
-                {ragEvalLoading ? 'Evaluating…' : 'Run RAG Eval'}
-              </button>
-            </div>
-
-            {ragEvalResult && <RagEvalResultPanel result={ragEvalResult} />}
-          </div>
         </>
       )}
 

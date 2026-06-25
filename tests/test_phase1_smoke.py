@@ -5,6 +5,7 @@ import pytest
 from pydantic import ValidationError
 
 from engine.extraction import Finding, FindingList
+from engine.nodes.subagent import _should_skip_source
 from engine.orchestrator import graph
 from engine.state import ResearchState, SubagentInput
 
@@ -68,3 +69,9 @@ def test_state_structure() -> None:
 def test_subagent_input() -> None:
     inp = SubagentInput(question="What are the latest advances in quantum hardware?")
     assert inp["question"].startswith("What")
+
+
+def test_subagent_skips_video_sources_for_grounding_stability() -> None:
+    assert _should_skip_source("https://www.youtube.com/watch?v=abc123")
+    assert _should_skip_source("https://youtu.be/abc123")
+    assert not _should_skip_source("https://www.copyright.gov/ai/")

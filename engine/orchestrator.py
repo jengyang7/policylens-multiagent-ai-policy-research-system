@@ -17,14 +17,35 @@ from engine.nodes.plan import plan
 from engine.nodes.subagent import subagent
 from engine.nodes.synthesize import synthesize
 from engine.nodes.verify_citations import verify_citations
-from engine.state import ResearchState, SubagentInput
+from engine.state import ResearchMode, ResearchState, SubagentInput
 
 DEFAULT_DEBATE_ROUNDS = 2
+DEFAULT_RUN_MODE: ResearchMode = "multi_agent_verified"
+COMPACTION_MODES: set[ResearchMode] = {"multi_agent_compaction", "multi_agent_verified"}
+VERIFIED_MODES: set[ResearchMode] = {"multi_agent_verified"}
+
+
+def _run_mode(state: ResearchState) -> ResearchMode:
+    return state.get("run_mode", DEFAULT_RUN_MODE)
+
+
+def _route_after_clarify(state: ResearchState) -> str | list[Send]:
+    """Conditional edge: single-agent benchmark skips planning fan-out."""
+    if _run_mode(state) == "single_agent":
+        return [Send("single_agent", SubagentInput(question=state["query"]))]
+    return "plan"
 
 
 def _fan_out(state: ResearchState) -> list[Send]:
     """Conditional edge: plan → one Send per subtask (parallel fan-out)."""
     return [Send("subagent", SubagentInput(question=q)) for q in state["subtasks"]]
+
+
+def _route_after_research(state: ResearchState) -> str:
+    """Conditional edge: skip compaction for raw benchmark modes."""
+    if state.get("debate_mode") or _run_mode(state) in COMPACTION_MODES:
+        return "compact"
+    return "synthesize"
 
 
 def _route_after_compact(state: ResearchState) -> str:
@@ -50,16 +71,29 @@ def _fan_out_gaps(state: ResearchState) -> list[Send] | str:
     return [Send("gap_subagent", SubagentInput(question=q)) for q in gaps]
 
 
+def _route_after_synthesize(state: ResearchState) -> str:
+    """Conditional edge: citation verifier is only in verified/debate modes."""
+    if state.get("debate_mode") or _run_mode(state) in VERIFIED_MODES:
+        return "verify_citations"
+    return END
+
+
 def build_graph(checkpointer: BaseCheckpointSaver | None = None) -> CompiledStateGraph:  # type: ignore[type-arg]
     """Build and compile the research graph.
 
     Graph flow:
         START → clarify → clarify_wait (interrupt if ambiguous) → plan
-              → N parallel subagents → compact (layer 2)
+              → N parallel subagents → [optional compact (layer 2)]
               → [debate mode only: debate_advocate ⇄ debate_skeptic × N rounds
                  → judge_debate → plan_gap_research
                  → M parallel gap_subagents → recompact]
-              → synthesize → verify_citations → END
+              → synthesize → [optional verify_citations] → END
+
+    Benchmark run modes:
+        single_agent: clarify → one subagent over the full query → synthesize
+        multi_agent_no_compaction: plan → fan-out → synthesize from raw findings
+        multi_agent_compaction: plan → fan-out → compact → synthesize
+        multi_agent_verified: plan → fan-out → compact → synthesize → verify
 
     Debate mode (off by default): two cross-provider agents argue over the
     compacted findings before synthesis. Each turn is its own node execution,
@@ -81,6 +115,7 @@ def build_graph(checkpointer: BaseCheckpointSaver | None = None) -> CompiledStat
 
     builder.add_node("clarify", clarify)            # type: ignore[arg-type]
     builder.add_node("clarify_wait", clarify_wait)  # type: ignore[arg-type]
+    builder.add_node("single_agent", subagent)      # type: ignore[arg-type]
     builder.add_node("plan", plan)                  # type: ignore[arg-type]
     builder.add_node("subagent", subagent)          # type: ignore[arg-type]
     builder.add_node("compact", compact)            # type: ignore[arg-type]
@@ -96,9 +131,14 @@ def build_graph(checkpointer: BaseCheckpointSaver | None = None) -> CompiledStat
     # Graph flow
     builder.add_edge(START, "clarify")
     builder.add_edge("clarify", "clarify_wait")
-    builder.add_edge("clarify_wait", "plan")
+    builder.add_conditional_edges(
+        "clarify_wait", _route_after_clarify, ["single_agent", "plan"]
+    )
+    builder.add_edge("single_agent", "synthesize")
     builder.add_conditional_edges("plan", _fan_out, ["subagent"])  # type: ignore[arg-type]
-    builder.add_edge("subagent", "compact")
+    builder.add_conditional_edges(
+        "subagent", _route_after_research, ["compact", "synthesize"]
+    )
     builder.add_conditional_edges(
         "compact", _route_after_compact, ["debate_advocate", "synthesize"]
     )
@@ -112,7 +152,9 @@ def build_graph(checkpointer: BaseCheckpointSaver | None = None) -> CompiledStat
     )
     builder.add_edge("gap_subagent", "recompact")
     builder.add_edge("recompact", "synthesize")
-    builder.add_edge("synthesize", "verify_citations")
+    builder.add_conditional_edges(
+        "synthesize", _route_after_synthesize, ["verify_citations", END]
+    )
     builder.add_edge("verify_citations", END)
 
     return builder.compile(checkpointer=checkpointer)  # type: ignore[return-value]

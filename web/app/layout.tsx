@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "MindClash",
-  description: "Multi-agent deep research with a built-in debate system",
+  title: "AI Policy Researcher",
+  description: "Citation-verified AI policy and regulation research",
 };
 
 export default function RootLayout({

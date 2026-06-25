@@ -9,8 +9,11 @@ import pytest
 from engine.models import role_default_models
 from engine.orchestrator import (
     _fan_out_gaps,
+    _route_after_clarify,
     _route_after_compact,
+    _route_after_research,
     _route_after_skeptic,
+    _route_after_synthesize,
     graph,
 )
 from engine.state import DebateTurn, ResearchState
@@ -42,6 +45,7 @@ def _turn(agent: str, round_no: int) -> DebateTurn:
 
 def test_graph_has_debate_nodes() -> None:
     nodes = list(graph.nodes.keys())
+    assert "single_agent" in nodes
     assert "debate_advocate" in nodes
     assert "debate_skeptic" in nodes
     # Neutral lead judgment after the final round
@@ -59,6 +63,29 @@ def test_route_after_compact_off_by_default() -> None:
 
 def test_route_after_compact_enters_debate() -> None:
     assert _route_after_compact(_base_state(debate_mode=True)) == "debate_advocate"
+
+
+def test_benchmark_modes_route_research_and_verifier() -> None:
+    assert _route_after_research(_base_state(run_mode="multi_agent_no_compaction")) == "synthesize"
+    assert _route_after_research(_base_state(run_mode="multi_agent_compaction")) == "compact"
+    assert _route_after_research(_base_state(run_mode="multi_agent_verified")) == "compact"
+    assert _route_after_research(_base_state(run_mode="single_agent")) == "synthesize"
+
+    assert _route_after_synthesize(_base_state(run_mode="multi_agent_no_compaction")) == "__end__"
+    assert _route_after_synthesize(_base_state(run_mode="multi_agent_compaction")) == "__end__"
+    assert (
+        _route_after_synthesize(_base_state(run_mode="multi_agent_verified"))
+        == "verify_citations"
+    )
+
+
+def test_single_agent_mode_skips_plan_fan_out() -> None:
+    routed = _route_after_clarify(_base_state(run_mode="single_agent", query="full query"))
+    assert isinstance(routed, list)
+    assert routed[0].node == "single_agent"
+    assert routed[0].arg["question"] == "full query"
+
+    assert _route_after_clarify(_base_state(run_mode="multi_agent_verified")) == "plan"
 
 
 def test_route_after_skeptic_loops_until_rounds_done() -> None:

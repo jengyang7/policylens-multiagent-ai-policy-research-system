@@ -1,22 +1,29 @@
-# General Multi-Agent Deep Research System (memory-engineering showcase)
+# AI Policy & Regulation Researcher (memory-engineering showcase)
 
 ## Context
 
-Greenfield **portfolio** project. The earlier plan layered two domain verticals (an AI Tooling
-Radar + a Financial Researcher) on top of a shared engine. The user wants **simplicity first**:
-build **one general, domain-agnostic multi-agent deep research system**.
+Greenfield **portfolio** project. The app now has one flagship vertical: **AI policy and
+regulation research**. It helps users track AI laws, policy proposals, regulator guidance,
+standards, enforcement actions, compliance obligations, and governance risk across jurisdictions.
+Because the user is based in Singapore, the default demo path should include Singapore AI
+governance and model-risk questions while still supporting cross-jurisdiction comparisons.
 
-So the scope is a single system: ask any question → the lead agent **asks clarifying questions if
-the query is ambiguous (human-in-the-loop)** → plans → parallel subagents research the web → the
-system synthesizes a **cited** report → and you can **follow up in chat**, with the system
-remembering within and across the conversation. The interesting depth is concentrated in
-**multi-agent orchestration + memory + human-in-the-loop**, not in domain logic.
+The product surface is domain-specific: ask an AI policy/regulatory question → the lead agent
+**asks clarifying questions if jurisdiction, time frame, or scope is ambiguous
+(human-in-the-loop)** → plans → parallel subagents research the web → the system synthesizes a
+**cited policy report** → and you can **follow up in chat**, with the system remembering within and
+across the conversation. The interesting depth is still concentrated in **multi-agent orchestration
++ memory + human-in-the-loop**, but the demo is now anchored in a concrete, reviewer-friendly
+domain.
 
 **RAG / vector memory is deliberately deferred** (see "Deferred"). The first version keeps memory
 simple: working memory + context compaction + a checkpointer. No embeddings, no vector DB.
 
 Decisions locked with the user:
-- **One general system** (no verticals, no domain adapters beyond generic web search/fetch).
+- **One flagship vertical:** AI Policy & Regulation Researcher, built on a reusable generic engine.
+- **Domain-specific research behavior:** prioritize jurisdiction, legal status, effective dates,
+  affected actors, obligations, enforcement mechanisms, exceptions, unresolved proposals, and
+  compliance implications.
 - **Framework:** Python + **LangGraph** (typed state, `Send` fan-out, Postgres checkpointer).
 - **Interface:** **minimal web UI** (FastAPI SSE backend + thin Next.js page that streams the live
   plan, the parallel subagents, the report, and a follow-up chat).
@@ -102,15 +109,22 @@ exactly where it paused. This reuses layer 3 — no new machinery.
 The README's "Memory architecture" section walks these three layers — the portfolio centerpiece. A
 fourth RAG/vector layer is the documented growth path (see "Deferred").
 
-## Engine design (domain-agnostic)
+## Engine design (reusable core + policy vertical)
 
-The engine knows nothing about any domain. Generic, swappable pieces only:
+The graph, memory layers, checkpointer, API streaming, and eval harness stay reusable. The flagship
+AI policy vertical is expressed through planner/extraction/synthesis prompts and source-selection
+biases, not by hard-coding one-off control flow.
 
-- **Tools** — `search` (Tavily or Exa) + `fetch` (URL → cleaned text). Treated as opaque callables
-  with schemas (function calling). Adding a domain later = adding a tool, nothing else.
+- **Tools** — `search` uses Tavily as the default broad search provider, Exa for deep semantic
+  retrieval, and SerpAPI as a Google-specific fallback. `fetch` uses Firecrawl for page
+  extraction/crawling when configured, with local `httpx` + BeautifulSoup extraction as fallback.
+  Policy research biases searches toward official regulators, legislatures, standards bodies,
+  courts, and credible legal-analysis sources.
 - **Extraction schema** — a Pydantic `Finding` shape every subagent result must validate against:
   `{claim, evidenceSpan, citationUrl}`. Rejects fabricated/unsupported values (anti-hallucination).
-- **Report** — a synthesis schema → Markdown renderer (sections + inline citations).
+- **Report** — a synthesis schema → Markdown renderer (sections + inline citations), with policy
+  reports emphasizing jurisdiction, legal status, obligations, effective dates, enforcement, and
+  compliance implications when supported by findings.
 
 ## Data model (Postgres)
 
@@ -143,8 +157,8 @@ deep-research/
       checkpointer.py      # LangGraph Postgres checkpointer (short-term/episodic)
       compaction.py        # summarization helpers
     tools/
-      search.py            # Tavily/Exa
-      fetch.py             # URL → cleaned text
+      search.py            # Tavily / Exa / SerpAPI
+      fetch.py             # Firecrawl scrape → local URL cleanup fallback
     extraction.py          # Pydantic Finding schema (anti-hallucination)
     models.py              # model IDs (verify at build time)
   api/

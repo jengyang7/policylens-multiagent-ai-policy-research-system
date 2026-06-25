@@ -17,16 +17,19 @@ class ResearchPlan(BaseModel):
 _PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        "You are a research planner. Given a research query:\n"
+        "You are a research planner for an AI Policy & Regulation Researcher. "
+        "The product specializes in AI laws, policy proposals, regulatory guidance, "
+        "standards, enforcement actions, compliance obligations, and governance risk. "
+        "Given a research query:\n"
         "1. In 'thinking': write 2-3 sentences explaining your approach — what the user "
         "   wants, what key angles to cover, and why you chose these sub-questions.\n"
         "2. In 'title': write a display heading that is a cleaned-up version of the "
         "   user's query — fix casing/grammar and drop filler, but PRESERVE the full "
         "   meaning, framing, and any comparisons, numbers, or timeframes. Do not "
-        "   generalize a pointed question into a vague topic label: for 'will AI "
-        "   replace more software engineers than it creates by 2030?' write 'Will AI "
-        "   Replace More Software Engineers Than It Creates by 2030?', NOT 'AI and "
-        "   Software Engineering Jobs'. Keep a question as a question (with the '?'); "
+        "   generalize a pointed question into a vague topic label: for 'what "
+        "   obligations does the EU AI Act create for high-risk AI systems?' write "
+        "   'What Obligations Does the EU AI Act Create for High-Risk AI Systems?', "
+        "   NOT 'EU AI Act Overview'. Keep a question as a question (with the '?'); "
         "   use title case; aim for at most ~12 words, shortening only when nothing "
         "   meaningful is lost.\n"
         "3. In 'subtasks': decompose into 3–6 independent, specific sub-questions that "
@@ -34,7 +37,17 @@ _PROMPT = ChatPromptTemplate.from_messages([
         "   answerable via a web search. Do not overlap. Prefer concrete, searchable "
         "   phrasing. Each sub-question is sent VERBATIM to a web search engine as the "
         "   query, so keep it short — one sentence, ideally under 20 words — and avoid "
-        "   stacking multiple clauses, comparisons, or caveats into a single sub-question.",
+        "   stacking multiple clauses, comparisons, or caveats into a single sub-question.\n"
+        "4. For AI policy/regulatory topics, make the sub-questions cover the most "
+        "   decision-relevant angles: jurisdiction, legal status, effective dates, "
+        "   obligations, affected actors, enforcement mechanisms, exceptions, unresolved "
+        "   proposals, and practical compliance implications. Prefer official regulator, "
+        "   legislature, standards-body, court, and credible legal-analysis sources.\n"
+        "5. For Singapore AI governance queries, include coverage of international "
+        "   alignment/cross-border considerations (e.g. ASEAN, OECD, standards, cross-border "
+        "   data flows) and public-private collaboration mechanisms (e.g. IMDA/PDPC/MAS "
+        "   consultations, AI Verify Foundation, sandboxes, industry working groups) when "
+        "   the user's question is broad enough to need a complete policy landscape.",
     ),
     ("human", "Research query: {query}"),
 ])

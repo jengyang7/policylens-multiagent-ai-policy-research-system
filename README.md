@@ -1,18 +1,21 @@
-# Multi-Agent Deep Research System
+# AI Policy & Regulation Researcher
 
-A general-purpose research assistant: ask any question, and a lead agent clarifies it with you if it's ambiguous, plans the research, fans out a team of **parallel subagents** to search and read the web, and synthesizes a **cited** report — with an optional **adversarial debate round** where two AI models from different companies argue over the findings before the report is written.
+An AI policy and regulation research assistant: ask about AI laws, policy proposals, regulator guidance, standards, enforcement actions, compliance obligations, or governance risk. A lead agent clarifies ambiguous jurisdiction/scope, plans the research, fans out **parallel subagents** to search and read the web, and synthesizes a **citation-verified policy report** — with an optional **adversarial debate round** where two AI models from different companies argue over the findings before the report is written.
 
-Built as a portfolio project to showcase **multi-agent orchestration**, a **layered memory architecture**, and **human-in-the-loop** workflows with LangGraph.
+The flagship demo is intentionally useful from Singapore: for example, ask *"How is Singapore regulating AI governance and model risk in 2026?"* and compare Singapore's approach against the EU, US, UK, or OECD.
+
+Built as a portfolio project to showcase **multi-agent orchestration**, a **layered memory architecture**, **human-in-the-loop** workflows, and domain-specific evidence synthesis with LangGraph. The AI policy vertical is the flagship product surface; the underlying orchestration engine remains reusable.
 
 ## Highlights
 
+- **AI policy intelligence** — reports track jurisdiction, legal status, effective dates, affected actors, obligations, enforcement mechanisms, exceptions, and compliance implications when the evidence supports them.
 - **Multi-agent orchestration** — a lead model plans the research and fans out N parallel subagents via LangGraph `Send`; each runs a `search → fetch → extract` loop and returns validated findings.
 - **Three-layer memory stack** — typed working state → context compaction → Postgres checkpointer. The same checkpointer layer powers resumable runs, multi-turn follow-up chat, *and* human-in-the-loop pause/resume.
 - **Human-in-the-loop clarification** — an ambiguous query triggers `interrupt()`; the UI shows clarifying questions, and `Command(resume=...)` continues the graph from exactly where it paused.
 - **Adversarial debate mode** — a Claude advocate and a Gemini skeptic argue over the findings (cross-provider, so their errors are uncorrelated), a neutral judge declares a winner, and the skeptic's unresolved objections drive a second, targeted research round before the final report.
 - **Anti-hallucination by construction** — every subagent claim must validate against a `{claim, evidenceSpan, citationUrl}` schema, and a citation-faithfulness/grounding eval harness checks the finished report.
-- **Live streaming UI** — a Next.js frontend streams the plan, parallel subagents, debate turns (token-by-token), the verdict, gap research, and the final report over SSE.
-- **Export** — download a full research session as Markdown or Word (`.docx`).
+- **Live streaming UI** — a Next.js frontend streams the plan, parallel subagents, debate turns (token-by-token), the verdict, gap research, and the final policy report over SSE.
+- **Export** — download a full policy research session as Markdown or Word (`.docx`).
 
 ## Architecture
 
@@ -82,7 +85,8 @@ All roles are user-selectable per run via the UI, gated by which provider API ke
 - **LLMs** — OpenAI, Anthropic, Google, via `langchain-openai` / `langchain-anthropic` / `langchain-google-genai`
 - **API** — FastAPI + Server-Sent Events (`sse-starlette`)
 - **Database** — Postgres, SQLAlchemy 2.0 (async), Alembic migrations
-- **Search & fetch** — Tavily, `httpx` + `beautifulsoup4`/`markdownify`
+- **Search & fetch** — Tavily for default search, Exa for semantic search, SerpAPI as Google
+  fallback, Firecrawl for page extraction/crawling, with local `httpx`/BeautifulSoup fallback
 - **Frontend** — Next.js 16, React 19, `react-markdown`
 - **Eval** — custom harness: citation grounding, faithfulness, completeness, relevance
 
@@ -93,7 +97,8 @@ All roles are user-selectable per run via the UI, gated by which provider API ke
 - Python 3.12+ and [uv](https://docs.astral.sh/uv/)
 - Node.js and pnpm
 - Docker (for Postgres)
-- API keys: OpenAI is required; Anthropic / Google / Tavily are optional and gate debate mode + web search
+- API keys: OpenAI is required; Anthropic / Google are optional for debate mode; Tavily, Exa,
+  or SerpAPI enable web search; Firecrawl is optional for stronger page extraction
 
 ### Setup
 
@@ -102,7 +107,7 @@ All roles are user-selectable per run via the UI, gated by which provider API ke
 docker-compose up -d
 
 # 2. Configure environment
-cp .env.example .env   # fill in OPENAI_API_KEY, TAVILY_API_KEY, etc.
+cp .env.example .env   # fill in OPENAI_API_KEY plus search/extraction keys
 
 # 3. Install dependencies & run migrations
 uv sync
@@ -147,7 +152,7 @@ engine/
   state.py          # typed ResearchState (working memory)
   nodes/            # clarify, plan, subagent, compact, debate, synthesize, chat, verify_citations
   memory/           # Postgres checkpointer
-  tools/            # search (Tavily), fetch (URL → cleaned text)
+  tools/            # search (Tavily / Exa / SerpAPI), fetch (Firecrawl → local fallback)
   models.py         # model IDs, pricing, provider routing
 api/                 # FastAPI app (SSE endpoints)
 db/                  # SQLAlchemy models + Alembic migrations
