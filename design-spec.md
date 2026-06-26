@@ -115,9 +115,8 @@ The graph, memory layers, checkpointer, API streaming, and eval harness stay reu
 AI policy vertical is expressed through planner/extraction/synthesis prompts and source-selection
 biases, not by hard-coding one-off control flow.
 
-- **Tools** — `search` uses Tavily as the default broad search provider, Exa for deep semantic
-  retrieval, and SerpAPI as a Google-specific fallback. `fetch` uses Firecrawl for page
-  extraction/crawling when configured, with local `httpx` + BeautifulSoup extraction as fallback.
+- **Tools** — `search` uses Tavily as the default broad search provider and Exa for deep semantic
+  retrieval. `fetch` uses direct `httpx` + BeautifulSoup extraction.
   Policy research biases searches toward official regulators, legislatures, standards bodies,
   courts, and credible legal-analysis sources.
 - **Extraction schema** — a Pydantic `Finding` shape every subagent result must validate against:
@@ -157,8 +156,8 @@ deep-research/
       checkpointer.py      # LangGraph Postgres checkpointer (short-term/episodic)
       compaction.py        # summarization helpers
     tools/
-      search.py            # Tavily / Exa / SerpAPI
-      fetch.py             # Firecrawl scrape → local URL cleanup fallback
+      search.py            # Tavily / Exa
+      fetch.py             # direct URL cleanup
     extraction.py          # Pydantic Finding schema (anti-hallucination)
     models.py              # model IDs (verify at build time)
   api/

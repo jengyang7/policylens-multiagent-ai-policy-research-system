@@ -7,64 +7,50 @@ import pytest
 import engine.tools.fetch as fetch_mod
 
 
-def test_fetch_uses_firecrawl_when_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fetch_uses_local_extraction(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, Any] = {}
 
     class FakeResponse:
+        text = """
+        <html>
+          <body>
+            <nav>skip me</nav>
+            <main><h1>Singapore AI</h1><p>Policy guidance</p></main>
+          </body>
+        </html>
+        """
+
         def raise_for_status(self) -> None:
             return None
 
-        def json(self) -> dict[str, Any]:
-            return {
-                "success": True,
-                "data": {"markdown": "# Singapore AI\n\nPolicy guidance"},
-            }
-
-    def fake_post(
+    def fake_get(
         url: str,
-        headers: dict[str, str],
-        json: dict[str, Any],
         timeout: int,
+        follow_redirects: bool,
+        headers: dict[str, str],
     ) -> FakeResponse:
         captured["url"] = url
-        captured["headers"] = headers
-        captured["json"] = json
         captured["timeout"] = timeout
+        captured["follow_redirects"] = follow_redirects
+        captured["headers"] = headers
         return FakeResponse()
 
-    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test")
-    monkeypatch.setattr(fetch_mod.httpx, "post", fake_post)
-    monkeypatch.setattr(fetch_mod, "_fetch_local", lambda url, max_chars: "local fallback")
+    monkeypatch.setattr(fetch_mod.httpx, "get", fake_get)
 
     result = fetch_mod.fetch("https://example.com")
 
-    assert result == "# Singapore AI\n\nPolicy guidance"
-    assert captured["url"] == "https://api.firecrawl.dev/v2/scrape"
-    assert captured["headers"]["Authorization"] == "Bearer fc-test"
-    assert captured["json"]["url"] == "https://example.com"
-    assert captured["json"]["formats"] == ["markdown"]
-    assert captured["json"]["onlyMainContent"] is True
+    assert "Singapore AI" in result
+    assert "Policy guidance" in result
+    assert "skip me" not in result
+    assert captured["url"] == "https://example.com"
+    assert captured["follow_redirects"] is True
+    assert "DeepResearch" in captured["headers"]["User-Agent"]
 
 
-def test_fetch_falls_back_to_local_when_firecrawl_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class FakeResponse:
-        def raise_for_status(self) -> None:
-            raise RuntimeError("firecrawl unavailable")
+def test_fetch_returns_empty_string_on_local_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_get(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("network unavailable")
 
-    def fake_post(*args: object, **kwargs: object) -> FakeResponse:
-        return FakeResponse()
+    monkeypatch.setattr(fetch_mod.httpx, "get", fake_get)
 
-    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test")
-    monkeypatch.setattr(fetch_mod.httpx, "post", fake_post)
-    monkeypatch.setattr(fetch_mod, "_fetch_local", lambda url, max_chars: "local fallback")
-
-    assert fetch_mod.fetch("https://example.com") == "local fallback"
-
-
-def test_fetch_skips_firecrawl_when_unconfigured(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
-    monkeypatch.setattr(fetch_mod, "_fetch_local", lambda url, max_chars: "local only")
-
-    assert fetch_mod.fetch("https://example.com") == "local only"
+    assert fetch_mod.fetch("https://example.com") == ""

@@ -85,8 +85,8 @@ All roles are user-selectable per run via the UI, gated by which provider API ke
 - **LLMs** — OpenAI, Anthropic, Google, via `langchain-openai` / `langchain-anthropic` / `langchain-google-genai`
 - **API** — FastAPI + Server-Sent Events (`sse-starlette`)
 - **Database** — Postgres, SQLAlchemy 2.0 (async), Alembic migrations
-- **Search & fetch** — Tavily for default search, Exa for semantic search, SerpAPI as Google
-  fallback, Firecrawl for page extraction/crawling, with local `httpx`/BeautifulSoup fallback
+- **Search & fetch** — Tavily for default search, Exa for semantic search, and direct
+  `httpx`/BeautifulSoup page extraction
 - **Frontend** — Next.js 16, React 19, `react-markdown`
 - **Eval** — custom harness: citation grounding, faithfulness, completeness, relevance
 
@@ -97,8 +97,8 @@ All roles are user-selectable per run via the UI, gated by which provider API ke
 - Python 3.12+ and [uv](https://docs.astral.sh/uv/)
 - Node.js and pnpm
 - Docker (for Postgres)
-- API keys: OpenAI is required; Anthropic / Google are optional for debate mode; Tavily, Exa,
-  or SerpAPI enable web search; Firecrawl is optional for stronger page extraction
+- API keys: OpenAI is required; Anthropic / Google are optional for debate mode; Tavily or Exa
+  enable web search
 
 ### Setup
 
@@ -152,7 +152,7 @@ engine/
   state.py          # typed ResearchState (working memory)
   nodes/            # clarify, plan, subagent, compact, debate, synthesize, chat, verify_citations
   memory/           # Postgres checkpointer
-  tools/            # search (Tavily / Exa / SerpAPI), fetch (Firecrawl → local fallback)
+  tools/            # search (Tavily / Exa), fetch (direct httpx/BeautifulSoup extraction)
   models.py         # model IDs, pricing, provider routing
 api/                 # FastAPI app (SSE endpoints)
 db/                  # SQLAlchemy models + Alembic migrations
