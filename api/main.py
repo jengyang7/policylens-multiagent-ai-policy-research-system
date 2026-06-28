@@ -263,8 +263,8 @@ async def _stream_graph(
       debate_turn         {type, agent, model, round, content}  (debate mode only)
       judging             {type}                      (debate mode only)
       debate_verdict      {type, winner, rows, model}  (debate mode only)
-      gap_planning        {type}                      (debate mode only)
-      gap_plan            {type, subtasks: [...]}     (debate mode only)
+      evidence_auditing   {type}                      (verified/debate modes)
+      evidence_audit      {type, sufficient, assessment, subtasks}
       synthesizing        {type}
       report              {type, content, run_id}
       clarification_needed {type, run_id, questions: [...]}
@@ -342,24 +342,33 @@ async def _stream_graph(
                         "question": question,
                         "findings_count": len(findings),
                         "sources": sources,
-                        # "gap" = second, debate-driven research round
+                        # "gap" = second, evidence-audit research round
                         "stage": "gap" if node_name == "gap_subagent" else "plan",
                         "compaction": compaction_enabled or node_name == "gap_subagent",
                     })
 
                 elif node_name == "compact":
-                    yield _evt({"type": "debating" if debate_mode else "synthesizing"})
+                    if debate_mode:
+                        yield _evt({"type": "debating"})
+                    elif run_mode == "multi_agent_verified":
+                        yield _evt({"type": "evidence_auditing"})
+                    else:
+                        yield _evt({"type": "synthesizing"})
 
                 elif node_name == "recompact":
                     # Gap findings folded back into the summary — synthesis is next
                     yield _evt({"type": "synthesizing"})
 
-                elif node_name == "plan_gap_research":
+                elif node_name == "evidence_audit":
+                    audit: dict[str, object] = node_output.get("evidence_audit", {})  # type: ignore[union-attr]
                     gaps: list[str] = node_output.get("gap_subtasks", [])  # type: ignore[union-attr]
-                    if gaps:
-                        yield _evt({"type": "gap_plan", "subtasks": gaps})
-                    else:
-                        # Debate surfaced no material gaps — straight to synthesis
+                    yield _evt({
+                        "type": "evidence_audit",
+                        "sufficient": bool(audit.get("sufficient", not gaps)),
+                        "assessment": str(audit.get("assessment", "")),
+                        "subtasks": gaps,
+                    })
+                    if not gaps:
                         yield _evt({"type": "synthesizing"})
 
                 elif node_name in ("debate_advocate", "debate_skeptic"):
@@ -382,9 +391,9 @@ async def _stream_graph(
                     verdict: dict | None = node_output.get("debate_verdict")  # type: ignore[union-attr]
                     if verdict:
                         yield _evt({"type": "debate_verdict", **verdict})
-                    # Judgment done — the lead now distills unresolved objections
-                    # into gap questions
-                    yield _evt({"type": "gap_planning"})
+                    # Debate is optional; every debate run now rejoins the same
+                    # evidence-quality gate used by normal verified research.
+                    yield _evt({"type": "evidence_auditing"})
 
                 elif node_name == "synthesize":
                     if run_mode != "multi_agent_verified" and not debate_mode:

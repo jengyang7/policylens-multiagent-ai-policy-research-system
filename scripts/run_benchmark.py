@@ -1,4 +1,4 @@
-"""Run an L1-L5 benchmark against the local API and export JSON + Markdown.
+"""Compare research configurations against the local API and export JSON + Markdown.
 
 Usage:
     uv run python scripts/run_benchmark.py
@@ -25,11 +25,8 @@ DEFAULT_QUERIES = [
 ]
 
 MODES = [
-    ("single_agent", False, "L1 Single Agent"),
-    ("multi_agent_no_compaction", False, "L2 Multi-Agent"),
-    ("multi_agent_compaction", False, "L3 Compacted"),
-    ("multi_agent_verified", False, "L4 Citation Checked"),
-    ("multi_agent_verified", True, "L5 Debate + Gap"),
+    ("multi_agent_verified", False, "Standard Research"),
+    ("multi_agent_verified", True, "Debate Research"),
 ]
 
 

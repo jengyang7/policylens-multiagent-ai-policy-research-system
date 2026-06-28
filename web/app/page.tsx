@@ -77,7 +77,7 @@ interface HistoryEntry {
   usageStats: UsageStats | null;
   runMode?: ResearchMode;
   debateTurns?: DebateTurn[];
-  // Second research round: gap questions distilled from the debate
+  // Optional second research round: questions produced by the evidence audit
   gapSubtasks?: SubtaskState[];
   // Whether this run was started in debate mode (drives milestones/progress)
   debateRun?: boolean;
@@ -87,13 +87,6 @@ interface HistoryEntry {
 const HISTORY_KEY = 'dra_history_v1';
 const ACTIVE_ID_KEY = 'dra_active_id_v1';
 const CLIENT_ID_KEY = 'dra_client_id_v1';
-
-const RESEARCH_MODE_OPTIONS: ModelOption[] = [
-  { id: 'multi_agent_verified', label: 'L4 Citation Checked', description: 'Multi-agent + compaction + verifier' },
-  { id: 'multi_agent_compaction', label: 'L3 Compacted', description: 'Multi-agent + compaction' },
-  { id: 'multi_agent_no_compaction', label: 'L2 Multi-Agent', description: 'Parallel agents, raw synthesis' },
-  { id: 'single_agent', label: 'L1 Single Agent', description: 'Baseline: one researcher' },
-];
 
 // Clickable starter queries on the New Policy Research page — click to research immediately
 const SUGGESTED_QUERIES = [
@@ -707,9 +700,9 @@ export default function Home() {
   // final report is ready so the report takes center stage (still re-openable)
   const [verdictExpanded, setVerdictExpanded] = useState(true);
 
-  // Debate-driven gap research (second finding round, debate mode only)
+  // Evidence-audit gap research (one optional second finding round)
   const [gapSubtasks,       setGapSubtasks]       = useState<SubtaskState[]>([]);
-  const [gapPlanningActive, setGapPlanningActive] = useState(false);
+  const [evidenceAuditActive, setEvidenceAuditActive] = useState(false);
 
   // Collapsible question-card rounds (like the debate panel): open while their
   // round is live, auto-collapsed when the report takes the stage
@@ -828,7 +821,7 @@ export default function Home() {
     setDebateTurns(entry.debateTurns ?? []);  // old localStorage entries lack this
     setGapSubtasks(entry.gapSubtasks ?? []);
     setDebatingActive(false); setDebateExpanded(false); setDebateStreaming(null);
-    setGapPlanningActive(false); setJudgingActive(false);
+    setEvidenceAuditActive(false); setJudgingActive(false);
     setDebateRun(entry.debateRun ?? (entry.debateTurns?.length ?? 0) > 0);
     setDebateVerdict(entry.debateVerdict ?? null);
     setPlanCardsExpanded(false); setGapCardsExpanded(false);
@@ -922,11 +915,8 @@ export default function Home() {
   }, [activeId, phase, query, title, runId, subtasks, sources, log, report, showReport, chatMessages, usageStats, runMode, debateTurns, gapSubtasks, debateRun, debateVerdict]);
 
   // ---------------------------------------------------------------------------
-  // Progress + milestones. Stage budgets differ per mode so the first research
-  // round can't push the bar to ~90% when a debate + second round still follow:
-  //   plain run:  plan 0–10 · research 10–72 · synthesis 80 · report 95 · reveal 100
-  //   debate run: plan 0–8 · research 8–36 · debate 38–58 · verdict 60 ·
-  //               gap plan 62 · gap research 64–84 · synthesis 88 · report 95
+  // Progress + milestones. Verified runs reserve room for the bounded evidence
+  // audit and its optional follow-up research round.
   // ---------------------------------------------------------------------------
 
   // Matches the backend DEFAULT_DEBATE_ROUNDS (2 rounds × 2 speakers)
@@ -935,6 +925,7 @@ export default function Home() {
   // Monotonic clamp: stage flags can flip off between SSE events (e.g. between
   // compaction and the next stage), and the bar must never move backward.
   const maxProgress = useRef(0);
+  const auditEnabled = debateRun || runMode === 'multi_agent_verified';
 
   const progressPct = (() => {
     const raw = (() => {
@@ -943,14 +934,21 @@ export default function Home() {
       const doneFrac = (round: SubtaskState[]) =>
         round.length === 0 ? 0 : round.filter(s => s.status === 'done').length / round.length;
       if (debateRun) {
-        if (synthesizingActive) return 88;
-        if (gapSubtasks.length > 0) return 64 + Math.round(doneFrac(gapSubtasks) * 20);
-        if (gapPlanningActive) return 62;
-        if (judgingActive || debateVerdict) return 60;
+        if (synthesizingActive) return 90;
+        if (gapSubtasks.length > 0) return 70 + Math.round(doneFrac(gapSubtasks) * 18);
+        if (evidenceAuditActive) return 66;
+        if (judgingActive || debateVerdict) return 62;
         const turns = Math.min(debateTurns.length + (debateStreaming ? 0.5 : 0), EXPECTED_DEBATE_TURNS);
-        if (turns > 0 || debatingActive) return 38 + Math.round((turns / EXPECTED_DEBATE_TURNS) * 20);
+        if (turns > 0 || debatingActive) return 40 + Math.round((turns / EXPECTED_DEBATE_TURNS) * 20);
         if (subtasks.length > 0) return 8 + Math.round(doneFrac(subtasks) * 28);
         return phase === 'researching' ? 3 : 0; // 3% = tiny visible sliver
+      }
+      if (auditEnabled) {
+        if (synthesizingActive) return 88;
+        if (gapSubtasks.length > 0) return 68 + Math.round(doneFrac(gapSubtasks) * 16);
+        if (evidenceAuditActive) return 64;
+        if (subtasks.length > 0) return 10 + Math.round(doneFrac(subtasks) * 48);
+        return phase === 'researching' ? 3 : 0;
       }
       if (synthesizingActive) return 80;
       if (subtasks.length > 0) return 10 + Math.round(doneFrac(subtasks) * 62);
@@ -960,17 +958,23 @@ export default function Home() {
   })();
   maxProgress.current = progressPct >= 100 ? 0 : progressPct;
 
-  // Milestone trail shown beside the progress bar — debate runs surface the
-  // extra debate / follow-up research stages
+  // Milestone trail shown beside the progress bar.
   const milestones = debateRun
-    ? ['Planning', 'Initial Research', 'Debate', 'Gap Research', 'Synthesizing', 'Report']
-    : ['Planning', 'Research', 'Synthesizing', 'Report'];
+    ? ['Planning', 'Initial Research', 'Debate', 'Evidence Audit', 'Follow-up Research', 'Synthesizing', 'Report']
+    : auditEnabled
+      ? ['Planning', 'Research', 'Evidence Audit', 'Follow-up Research', 'Synthesizing', 'Report']
+      : ['Planning', 'Research', 'Synthesizing', 'Report'];
   const milestoneIdx = (() => {
     if (report) return milestones.length - 1;
     if (synthesizingActive) return milestones.length - 2;
     if (debateRun) {
-      if (gapPlanningActive || gapSubtasks.length > 0) return 3;
+      if (gapSubtasks.length > 0) return 4;
+      if (evidenceAuditActive) return 3;
       if (debatingActive || judgingActive || debateStreaming || debateTurns.length > 0) return 2;
+    }
+    if (auditEnabled) {
+      if (gapSubtasks.length > 0) return 3;
+      if (evidenceAuditActive) return 2;
     }
     if (subtasks.length > 0) return 1;
     return 0;
@@ -1092,29 +1096,34 @@ export default function Home() {
       const label = winner === 'draw' ? 'Draw' : `${verdictWinnerLabel(winner)} wins`;
       const detail = rows.map(r => `${r.category}: ${r.assessment}`).join(' ');
       addLog('debate', `Debate Verdict — ${label}`, detail.slice(0, 160) + (detail.length > 160 ? '…' : ''), serverTs);
-    } else if (type === 'gap_planning') {
+    } else if (type === 'evidence_auditing') {
       setDebatingActive(false);
       setJudgingActive(false);
-      setGapPlanningActive(true);
-      addLog('plan', 'Identifying Evidence Gaps', 'Distilling unresolved objections from the debate into follow-up research questions', serverTs);
-    } else if (type === 'gap_plan') {
+      setEvidenceAuditActive(true);
+      addLog('plan', 'Auditing Evidence', 'Checking coverage, source quality, contradictions, and unanswered questions', serverTs);
+    } else if (type === 'evidence_audit') {
       const qs = (data.subtasks as string[]) ?? [];
+      const assessment = (data.assessment as string) ?? '';
       const newGapSubtasks: SubtaskState[] = qs.map(q => ({ question: q, status: 'pending', findingsCount: 0 }));
-      setGapPlanningActive(false);
-      setDebateExpanded(false); // debate is over — focus moves to the second finding round
-      setVerdictExpanded(false); // follow-up research is starting — verdict card steps aside
+      setEvidenceAuditActive(false);
       setGapSubtasks(newGapSubtasks);
       gapSubtasksRef.current = newGapSubtasks;
-      setGapCardsExpanded(true);
       stageProgress.current.gap = { total: qs.length, done: 0 };
-      addLog('plan', 'Follow-up Research Plan', `${qs.length} gap question${qs.length !== 1 ? 's' : ''} from the debate`, serverTs);
+      if (qs.length > 0) {
+        setDebateExpanded(false);
+        setVerdictExpanded(false);
+        setGapCardsExpanded(true);
+        addLog('plan', 'Evidence Gaps Found', `${qs.length} follow-up question${qs.length !== 1 ? 's' : ''}${assessment ? ` · ${assessment}` : ''}`, serverTs);
+      } else {
+        addLog('plan', 'Evidence Audit Passed', assessment || 'The collected evidence is sufficient for synthesis', serverTs);
+      }
     } else if (type === 'synthesizing') {
       setDebatingActive(false);
       setJudgingActive(false);
-      setGapPlanningActive(false);
+      setEvidenceAuditActive(false);
       setSynthesizingActive(true);
       // Synthesis is the last step before the report — every earlier step
-      // (planning, research, debate, judging, gap research) is now complete.
+      // (planning, research, optional debate, audit, gap research) is complete.
       setPlanCardsExpanded(false);
       setDebateExpanded(false);
       setVerdictExpanded(false);
@@ -1173,7 +1182,7 @@ export default function Home() {
   async function startResearch(presetQuery?: string) {
     const trimmed = (presetQuery ?? query).trim();
     if (!trimmed) return;
-    const activeRunMode: ResearchMode = debateMode ? 'multi_agent_verified' : runMode;
+    const activeRunMode: ResearchMode = 'multi_agent_verified';
     setQuery(trimmed);
     setPhase('querying');
     setTitle('');
@@ -1183,7 +1192,7 @@ export default function Home() {
     setSynthesizingActive(false); setResearchEndTime(null); setUsageStats(null);
     setDebateTurns([]); setDebatingActive(false); setDebateExpanded(true); setDebateStreaming(null);
     setDebateRun(debateMode); setRunMode(activeRunMode); setJudgingActive(false); setDebateVerdict(null);
-    setGapSubtasks([]); setGapPlanningActive(false);
+    setGapSubtasks([]); setEvidenceAuditActive(false);
     setPlanCardsExpanded(true); setGapCardsExpanded(true);
     maxProgress.current = 0;
     stageProgress.current = { plan: { total: 0, done: 0 }, gap: { total: 0, done: 0 } };
@@ -1369,7 +1378,7 @@ export default function Home() {
     setUsageStats(null);
     setDebateTurns([]); setDebatingActive(false); setDebateExpanded(true); setDebateStreaming(null);
     setDebateRun(false); setJudgingActive(false); setDebateVerdict(null);
-    setGapSubtasks([]); setGapPlanningActive(false);
+    setGapSubtasks([]); setEvidenceAuditActive(false);
     setPlanCardsExpanded(true); setGapCardsExpanded(true); setDocxBusy(false);
     maxProgress.current = 0;
     stageProgress.current = { plan: { total: 0, done: 0 }, gap: { total: 0, done: 0 } };
@@ -2008,20 +2017,11 @@ export default function Home() {
                         </button>
                         {debateInfoOpen && (
                           <div className="absolute bottom-full left-0 mb-2 w-64 bg-gray-900 text-white text-xs text-left leading-relaxed rounded-xl shadow-lg px-3 py-2.5 z-10">
-                            When enabled, two AI models challenge each other’s policy analysis, identify weak evidence and missing jurisdictions, then do extra research before producing a final report. This takes longer but often results in a more thorough answer.
+                            Experimental mode: two AI models challenge the collected findings before the same evidence audit and final report. It takes longer and is intended for comparison with standard research.
                             <div className="absolute top-full left-4 w-2 h-2 bg-gray-900 rotate-45 -mt-1" />
                           </div>
                         )}
                       </div>
-                      <span className="flex items-center gap-1">
-                        <span className="hidden sm:inline text-[11px] text-gray-400 font-medium">Quality</span>
-                        <ModelPicker
-                          options={RESEARCH_MODE_OPTIONS}
-                          value={debateMode ? 'multi_agent_verified' : runMode}
-                          onChange={id => setRunMode(id as ResearchMode)}
-                          disabled={phase === 'querying' || debateMode}
-                        />
-                      </span>
                       {modelOptions.length > 0 && (
                         <ModelPicker
                           options={modelOptions}
@@ -2400,11 +2400,11 @@ export default function Home() {
                     </div>
                   )}
 
-                  {/* Gap planning — the lead distills debate objections into follow-up questions */}
-                  {gapPlanningActive && (
+                  {/* Bounded evidence audit before synthesis */}
+                  {evidenceAuditActive && (
                     <div className="flex items-center gap-2 text-sm text-gray-500">
                       <Spinner />
-                      <span>🧩 Identifying evidence gaps from the debate…</span>
+                      <span>🧩 Auditing coverage and identifying material evidence gaps…</span>
                     </div>
                   )}
 
@@ -2578,10 +2578,10 @@ export default function Home() {
                   </div>
                 )}
 
-                {/* Second finding round — gap questions distilled from the debate */}
+                {/* Optional second finding round produced by the evidence audit */}
                 {gapSubtasks.length > 0 && (
                   <SubtaskCards
-                    heading="Follow-up Research — Gaps from the Debate"
+                    heading="Follow-up Research — Evidence Gaps"
                     icon="🧩"
                     subtasks={gapSubtasks}
                     expanded={gapCardsExpanded}

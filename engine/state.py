@@ -40,6 +40,13 @@ class DebateVerdict(TypedDict):
     model: str              # judge model (the run's lead model)
 
 
+class EvidenceAuditResult(TypedDict):
+    """Bounded pre-synthesis assessment of research coverage and evidence quality."""
+    sufficient: bool
+    assessment: str
+    gap_questions: list[str]
+
+
 class TokenUsage(TypedDict):
     """Token usage for a single LLM call, tagged by node + model (cost tracking)."""
     node: str
@@ -98,9 +105,11 @@ class ResearchState(TypedDict):
     # The lead model's neutral verdict on who won the debate, set by the
     # judge_debate node after the final round
     debate_verdict: NotRequired[DebateVerdict]
-    # Debate-driven gap research: follow-up questions distilled from the
-    # skeptic's unresolved objections, researched in a second subagent round
+    # Evidence-audit follow-up questions, researched in one bounded second round
     gap_subtasks: NotRequired[list[str]]
+    # Shared pre-synthesis quality gate. Available in normal verified runs and
+    # debate runs; may trigger one bounded follow-up research round.
+    evidence_audit: NotRequired[EvidenceAuditResult]
     # Final cited Markdown report written by the synthesize node
     report: str
     # add_messages reducer enables multi-turn follow-up chat (layer 3)

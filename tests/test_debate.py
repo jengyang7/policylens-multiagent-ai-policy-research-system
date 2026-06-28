@@ -50,15 +50,19 @@ def test_graph_has_debate_nodes() -> None:
     assert "debate_skeptic" in nodes
     # Neutral lead judgment after the final round
     assert "judge_debate" in nodes
-    # Debate-driven gap research round
-    assert "plan_gap_research" in nodes
+    # Shared evidence audit + optional gap research round
+    assert "evidence_audit" in nodes
     assert "gap_subagent" in nodes
     assert "recompact" in nodes
 
 
 def test_route_after_compact_off_by_default() -> None:
-    assert _route_after_compact(_base_state()) == "synthesize"
-    assert _route_after_compact(_base_state(debate_mode=False)) == "synthesize"
+    assert _route_after_compact(_base_state()) == "evidence_audit"
+    assert _route_after_compact(_base_state(debate_mode=False)) == "evidence_audit"
+    assert (
+        _route_after_compact(_base_state(run_mode="multi_agent_compaction"))
+        == "synthesize"
+    )
 
 
 def test_route_after_compact_enters_debate() -> None:
@@ -112,33 +116,6 @@ def test_fan_out_gaps_sends_one_per_question_or_skips() -> None:
     assert isinstance(sends, list)
     assert [s.node for s in sends] == ["gap_subagent", "gap_subagent"]
     assert [s.arg["question"] for s in sends] == ["q1", "q2"]
-
-
-def test_plan_gap_research_returns_capped_questions(monkeypatch: pytest.MonkeyPatch) -> None:
-    import engine.nodes.debate as debate_mod
-    from engine.nodes.debate import MAX_GAP_QUESTIONS, plan_gap_research
-
-    captured: dict[str, object] = {}
-    parsed = MagicMock()
-    parsed.gap_questions = [f"gap {i}" for i in range(MAX_GAP_QUESTIONS + 2)]
-    raw_msg = MagicMock()
-    raw_msg.usage_metadata = None
-
-    raw_result = {"raw": raw_msg, "parsed": parsed}
-    mock_chain = MagicMock()
-    mock_chain.invoke = lambda inputs: (captured.update(inputs), raw_result)[1]
-    mock_structured = MagicMock()
-    mock_llm = MagicMock()
-    mock_llm.with_structured_output = MagicMock(return_value=mock_structured)
-    monkeypatch.setattr(debate_mod, "make_chat_model", lambda *a, **kw: mock_llm)
-    mock_prompt = MagicMock()
-    mock_prompt.__or__ = lambda s, o: mock_chain
-    monkeypatch.setattr(debate_mod, "_GAP_PROMPT", mock_prompt)
-
-    state = _base_state(debate_turns=[_turn("advocate", 1), _turn("skeptic", 1)])
-    result = plan_gap_research(state)
-    assert result["gap_subtasks"] == [f"gap {i}" for i in range(MAX_GAP_QUESTIONS)]
-    assert "[Round 1 — Opposition]" in str(captured["transcript"])
 
 
 def test_judge_debate_returns_verdict(monkeypatch: pytest.MonkeyPatch) -> None:

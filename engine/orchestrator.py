@@ -11,8 +11,8 @@ from engine.nodes.debate import (
     debate_advocate,
     debate_skeptic,
     judge_debate,
-    plan_gap_research,
 )
+from engine.nodes.evidence_audit import evidence_audit
 from engine.nodes.plan import plan
 from engine.nodes.subagent import subagent
 from engine.nodes.synthesize import synthesize
@@ -49,8 +49,12 @@ def _route_after_research(state: ResearchState) -> str:
 
 
 def _route_after_compact(state: ResearchState) -> str:
-    """Conditional edge: enter the debate loop only when debate mode is on."""
-    return "debate_advocate" if state.get("debate_mode") else "synthesize"
+    """Enter optional debate or the shared audit; benchmark compaction skips both."""
+    if state.get("debate_mode"):
+        return "debate_advocate"
+    if _run_mode(state) in VERIFIED_MODES:
+        return "evidence_audit"
+    return "synthesize"
 
 
 def _route_after_skeptic(state: ResearchState) -> str:
@@ -63,8 +67,7 @@ def _route_after_skeptic(state: ResearchState) -> str:
 
 
 def _fan_out_gaps(state: ResearchState) -> list[Send] | str:
-    """Conditional edge: one Send per gap question, or straight to synthesize
-    when the debate surfaced no material evidence gaps."""
+    """One Send per audited gap, or synthesize when evidence is sufficient."""
     gaps = state.get("gap_subtasks", [])
     if not gaps:
         return "synthesize"
@@ -84,26 +87,27 @@ def build_graph(checkpointer: BaseCheckpointSaver | None = None) -> CompiledStat
     Graph flow:
         START → clarify → clarify_wait (interrupt if ambiguous) → plan
               → N parallel subagents → [optional compact (layer 2)]
-              → [debate mode only: debate_advocate ⇄ debate_skeptic × N rounds
-                 → judge_debate → plan_gap_research
-                 → M parallel gap_subagents → recompact]
+              → [optional debate: debate_advocate ⇄ debate_skeptic × N rounds
+                 → judge_debate]
+              → [verified/debate: evidence_audit
+                 → optional M parallel gap_subagents → recompact]
               → synthesize → [optional verify_citations] → END
 
     Benchmark run modes:
         single_agent: clarify → one subagent over the full query → synthesize
         multi_agent_no_compaction: plan → fan-out → synthesize from raw findings
         multi_agent_compaction: plan → fan-out → compact → synthesize
-        multi_agent_verified: plan → fan-out → compact → synthesize → verify
+        multi_agent_verified: plan → fan-out → compact → evidence audit
+                              → optional gap fan-out → synthesize → verify
 
     Debate mode (off by default): two cross-provider agents argue over the
     compacted findings before synthesis. Each turn is its own node execution,
     so turns stream individually and checkpoint per turn. After the final
     round, judge_debate (neutral lead model) declares a winner for the UI
-    verdict card. The debate then drives a second research round:
-    plan_gap_research distills unresolved skeptic objections into follow-up
-    questions, gap_subagents (same subagent fn, separate node name so the
-    fan-in edge targets recompact, not compact) research them, and recompact
-    folds the new findings into state.summary.
+    verdict card. Both debate and normal verified runs then pass through the
+    same bounded evidence audit. It can emit follow-up questions once;
+    gap_subagents (same subagent fn under a separate node name) research them,
+    and recompact folds the new findings into state.summary.
 
     Two-node clarify design: clarify calls the LLM once; clarify_wait holds the
     interrupt() so the LLM is never re-called on resume.
@@ -122,7 +126,7 @@ def build_graph(checkpointer: BaseCheckpointSaver | None = None) -> CompiledStat
     builder.add_node("debate_advocate", debate_advocate)  # type: ignore[arg-type]
     builder.add_node("debate_skeptic", debate_skeptic)    # type: ignore[arg-type]
     builder.add_node("judge_debate", judge_debate)        # type: ignore[arg-type]
-    builder.add_node("plan_gap_research", plan_gap_research)  # type: ignore[arg-type]
+    builder.add_node("evidence_audit", evidence_audit)    # type: ignore[arg-type]
     builder.add_node("gap_subagent", subagent)      # type: ignore[arg-type]
     builder.add_node("recompact", compact)          # type: ignore[arg-type]
     builder.add_node("synthesize", synthesize)      # type: ignore[arg-type]
@@ -140,15 +144,15 @@ def build_graph(checkpointer: BaseCheckpointSaver | None = None) -> CompiledStat
         "subagent", _route_after_research, ["compact", "synthesize"]
     )
     builder.add_conditional_edges(
-        "compact", _route_after_compact, ["debate_advocate", "synthesize"]
+        "compact", _route_after_compact, ["debate_advocate", "evidence_audit", "synthesize"]
     )
     builder.add_edge("debate_advocate", "debate_skeptic")
     builder.add_conditional_edges(
         "debate_skeptic", _route_after_skeptic, ["debate_advocate", "judge_debate"]
     )
-    builder.add_edge("judge_debate", "plan_gap_research")
+    builder.add_edge("judge_debate", "evidence_audit")
     builder.add_conditional_edges(
-        "plan_gap_research", _fan_out_gaps, ["gap_subagent", "synthesize"]
+        "evidence_audit", _fan_out_gaps, ["gap_subagent", "synthesize"]
     )
     builder.add_edge("gap_subagent", "recompact")
     builder.add_edge("recompact", "synthesize")

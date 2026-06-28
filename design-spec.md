@@ -11,7 +11,8 @@ governance and model-risk questions while still supporting cross-jurisdiction co
 The product surface is domain-specific: ask an AI policy/regulatory question → the lead agent
 **asks clarifying questions if jurisdiction, time frame, or scope is ambiguous
 (human-in-the-loop)** → plans → parallel subagents research the web → the system synthesizes a
-**cited policy report** → and you can **follow up in chat**, with the system remembering within and
+**cited policy report**. Before synthesis, a bounded **evidence audit** either approves the
+collected evidence or launches one targeted follow-up research round → and you can **follow up in chat**, with the system remembering within and
 across the conversation. The interesting depth is still concentrated in **multi-agent orchestration
 + memory + human-in-the-loop**, but the demo is now anchored in a concrete, reviewer-friendly
 domain.
@@ -39,8 +40,9 @@ Decisions locked with the user:
 | **3. Synthesizer** | gpt-5.4 | Takes the compacted findings from all subagents and writes the final cited report. |
 | **4. Chat / follow-up** | gpt-5.4 | Answers follow-up questions, grounded in the run's findings held in checkpointer state. |
 
-Not agents (utility nodes/functions the agents call): the **compaction** step (note summarization —
-an LLM call but makes no decisions) and the **tools** (`search`, `fetch`).
+Not standalone agents: the **compaction** step (note summarization — an LLM call but makes no
+decisions), the bounded **evidence audit** supervisor gate (one sufficiency decision), and the
+**tools** (`search`, `fetch`).
 
 ## What this demonstrates to a reviewer
 
@@ -77,6 +79,11 @@ an LLM call but makes no decisions) and the **tools** (`search`, `fetch`).
                     │ Compaction node    │  summarize notes,
                     │ → state.summary    │  trim stale tool outputs
                     └─────────┬──────────┘
+                              ▼
+                    ┌──────────────────┐
+                    │ Evidence audit   │  sufficient → synthesize
+                    │ (one pass)       │  gaps → targeted fan-out → recompact
+                    └────────┬─────────┘
                               ▼
                     ┌──────────────────┐
                     │ Synthesis        │   cited report
@@ -150,6 +157,7 @@ deep-research/
       plan.py              # decompose (clarified) query → subtasks (Gemini 2.5 Pro)
       subagent.py          # search → fetch → extract validated findings (Gemini 3.1 Flash-Lite)
       compact.py           # CONTEXT COMPACTION: summarize notes, trim stale outputs
+      evidence_audit.py    # bounded coverage check → optional one-time gap fan-out
       synthesize.py        # cited report (Gemini 2.5 Pro)
       chat.py              # follow-up grounded in checkpointer state
     memory/
@@ -213,7 +221,9 @@ deep-research/
 **Phase 4 — Eval + polish.**
 8. `eval/` — faithfulness + citation-grounding harness (every claim traces to a fetched source;
    flag ungrounded claims). Optional LangSmith traces.
-9. README with the pain story, architecture diagram, the **Memory architecture** section (three
+9. Add the bounded `evidence_audit` quality gate before synthesis; material gaps get one targeted
+   follow-up `Send` fan-out and recompaction, never an unrestricted reflection loop.
+10. README with the pain story, architecture diagram, the **Memory architecture** section (three
    layers), and the **human-in-the-loop** flow; a cached/seeded demo run so the UI works offline.
 
 ## Verification (end-to-end)

@@ -12,9 +12,10 @@ Built as a portfolio project to showcase **multi-agent orchestration**, a **laye
 - **Multi-agent orchestration** — a lead model plans the research and fans out N parallel subagents via LangGraph `Send`; each runs a `search → fetch → extract` loop and returns validated findings.
 - **Three-layer memory stack** — typed working state → context compaction → Postgres checkpointer. The same checkpointer layer powers resumable runs, multi-turn follow-up chat, *and* human-in-the-loop pause/resume.
 - **Human-in-the-loop clarification** — an ambiguous query triggers `interrupt()`; the UI shows clarifying questions, and `Command(resume=...)` continues the graph from exactly where it paused.
-- **Adversarial debate mode** — a Claude advocate and a Gemini skeptic argue over the findings (cross-provider, so their errors are uncorrelated), a neutral judge declares a winner, and the skeptic's unresolved objections drive a second, targeted research round before the final report.
+- **Bounded evidence audit** — verified runs check coverage, source quality, contradictions, and unanswered subtasks before synthesis; material gaps trigger at most one targeted follow-up research round.
+- **Experimental debate mode** — an optional Claude advocate and Gemini skeptic argue over the findings before the shared evidence audit; a neutral judge renders an informational verdict.
 - **Anti-hallucination by construction** — every subagent claim must validate against a `{claim, evidenceSpan, citationUrl}` schema, and a citation-faithfulness/grounding eval harness checks the finished report.
-- **Live streaming UI** — a Next.js frontend streams the plan, parallel subagents, debate turns (token-by-token), the verdict, gap research, and the final policy report over SSE.
+- **Live streaming UI** — a Next.js frontend streams the plan, parallel subagents, evidence audit, optional follow-up research, debate turns when enabled, and the final policy report over SSE.
 - **Export** — download a full policy research session as Markdown or Word (`.docx`).
 
 ## Architecture
@@ -33,18 +34,21 @@ plan (lead model)
   ▼
 compact  (layer 2: state.summary, trims stale tool output)
   │
-  ├── debate mode off ───────────────────────────────┐
-  │                                                    ▼
-  └── debate mode on:                            synthesize → cited report
-        debate_advocate ⇄ debate_skeptic (N rounds)    │
-              │                                        ▼
-        judge_debate (neutral lead → verdict)    verify_citations
-              │                                        │
-        plan_gap_research                              ▼
-              │                                  follow-up chat
-        Send fan-out ─► gap subagents              (grounded in
-              │                                  checkpointer state)
-        recompact ──────────────────────────────────┘
+  ├── debate off ──────────────────────────────────────┐
+  └── debate on: advocate ⇄ skeptic → judge ───────────┤
+                                                       ▼
+                                                evidence_audit
+                                                  │        │
+                                      sufficient ─┘        └─ gaps
+                                                  │             │
+                                                  │      Send → gap subagents
+                                                  │             │
+                                                  │         recompact
+                                                  ▼             ▼
+                                             synthesize → verify_citations
+                                                            │
+                                                            ▼
+                                                     follow-up chat
 ```
 
 ## The memory stack (the showcase)
@@ -55,14 +59,14 @@ compact  (layer 2: state.summary, trims stale tool output)
 
 A vector/RAG long-term memory layer is the documented next step (see [Roadmap](#roadmap)), deliberately deferred from v1.
 
-## Debate mode
+## Experimental debate mode
 
 When a run is started with `debate: true`:
 
 - **`debate_advocate`** (default: Claude Sonnet) argues the strongest evidence-backed answer from the compacted findings.
 - **`debate_skeptic`** (default: Gemini 3.1 Pro) attacks evidence quality, gaps, and overreach — for N rounds (default 2), streaming token-by-token.
 - **`judge_debate`** (neutral lead model) declares a winner — advocate / skeptic / draw — rendered as a verdict card.
-- **`plan_gap_research`** distills the skeptic's unresolved objections into up to 3 follow-up questions, researched by a second `Send` fan-out (`gap_subagent`), and **`recompact`** folds the new findings back into the summary.
+- Debate then rejoins the same **`evidence_audit`** used by normal verified runs. The audit may emit up to 3 follow-up questions for a second `Send` fan-out (`gap_subagent`), and **`recompact`** folds those findings into the summary.
 - Debaters default to **different AI companies** so their errors are uncorrelated, and the lead model stays a neutral third party (avoiding self-preference bias).
 - The synthesizer reads the debate transcript to calibrate confidence in the final report.
 
@@ -150,7 +154,7 @@ Exits non-zero if any claim is ungrounded (or, with `--strict`, any citation is 
 engine/
   orchestrator.py   # LangGraph graph definition
   state.py          # typed ResearchState (working memory)
-  nodes/            # clarify, plan, subagent, compact, debate, synthesize, chat, verify_citations
+  nodes/            # clarify, plan, subagent, compact, evidence_audit, debate, synthesize, verify
   memory/           # Postgres checkpointer
   tools/            # search (Tavily / Exa), fetch (direct httpx/BeautifulSoup extraction)
   models.py         # model IDs, pricing, provider routing

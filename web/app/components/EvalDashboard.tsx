@@ -128,6 +128,12 @@ interface ModelsResponse {
   options: ModelOption[];
 }
 
+interface BenchmarkRunProgress {
+  stage: string;
+  detail?: string;
+  percent: number;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -163,11 +169,11 @@ function fmtScore(v: number | null): string {
 
 function modeLabel(mode?: string): string {
   const labels: Record<string, string> = {
-    single_agent: 'L1 Single Agent',
-    multi_agent_no_compaction: 'L2 Multi-Agent',
-    multi_agent_compaction: 'L3 Compacted',
-    multi_agent_verified: 'L4 Citation Checked',
-    debate_gap: 'L5 Debate + Gap',
+    single_agent: 'Legacy Run',
+    multi_agent_no_compaction: 'Legacy Run',
+    multi_agent_compaction: 'Legacy Run',
+    multi_agent_verified: 'Standard Research',
+    debate_gap: 'Debate Research',
     legacy: 'Legacy Run',
     unknown: 'Legacy Run',
   };
@@ -176,11 +182,8 @@ function modeLabel(mode?: string): string {
 
 function modeRank(mode?: string): number {
   const ranks: Record<string, number> = {
-    single_agent: 1,
-    multi_agent_no_compaction: 2,
-    multi_agent_compaction: 3,
-    multi_agent_verified: 4,
-    debate_gap: 5,
+    multi_agent_verified: 1,
+    debate_gap: 2,
   };
   return ranks[mode ?? ''] ?? 99;
 }
@@ -474,12 +477,16 @@ function DetailPanel({ detail, loading }: { detail: EvalReportDetail | null; loa
       <div className="flex items-start justify-between gap-3 flex-wrap">
         <div className="min-w-0">
           <p className="text-sm font-semibold text-gray-900 truncate">{detail.query}</p>
-          <p className="text-xs text-gray-400 mt-0.5">{fmtDate(detail.generated_at)}</p>
+          <p className="text-xs text-gray-400 mt-0.5">
+            {fmtDate(detail.generated_at)}
+            {' · '}Run {detail.run_id.slice(0, 8)}
+            {' · '}Eval {detail.id.slice(0, 8)}
+          </p>
         </div>
         <div className="flex flex-shrink-0 items-center gap-2">
           <button
             onClick={() => downloadText(
-              `${slugify(detail.query)}-eval-${new Date(detail.generated_at).toISOString().slice(0, 10)}.md`,
+              `${slugify(detail.query)}-eval-${new Date(detail.generated_at).toISOString().slice(0, 10)}-${detail.run_id.slice(0, 8)}-${detail.id.slice(0, 8)}.md`,
               buildEvalDetailMarkdown(detail),
             )}
             className="text-xs font-semibold text-blue-600 hover:text-blue-800 border border-blue-100 hover:border-blue-200 bg-blue-50 rounded-lg px-2.5 py-1 transition-colors"
@@ -633,7 +640,12 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
   const [benchmarkQuestions, setBenchmarkQuestions] = useState('');
   const [benchmarkRunning, setBenchmarkRunning] = useState(false);
   const [benchmarkProgress, setBenchmarkProgress] = useState('');
+  const [benchmarkStage, setBenchmarkStage] = useState('');
+  const [benchmarkDetail, setBenchmarkDetail] = useState('');
+  const [benchmarkPercent, setBenchmarkPercent] = useState(0);
   const detailRef = useRef<HTMLDivElement>(null);
+  // Prevent an older detail request from overwriting a newer selection.
+  const detailRequestRef = useRef(0);
 
   // Custom confirmation modal (replaces window.confirm for destructive actions)
   const [confirmDialog, setConfirmDialog] = useState<{
@@ -707,7 +719,7 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
     for (const report of reports) {
       const run = runsById.get(report.run_id);
       const mode = run?.stats?.mode ?? 'unknown';
-      if (mode === 'unknown') continue;
+      if (!['multi_agent_verified', 'debate_gap'].includes(mode)) continue;
       const group = grouped.get(mode) ?? { reports: [], runs: [] };
       group.reports.push(report);
       if (run) group.runs.push(run);
@@ -765,28 +777,45 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
         + `${row.avgLatency === undefined ? '—' : `${row.avgLatency.toFixed(1)}s`} |`
       )),
     ];
-    downloadText('benchmark-ablation-table.md', lines.join('\n') + '\n');
+    downloadText('debate-comparison.md', lines.join('\n') + '\n');
   }
 
-  const loadDetail = useCallback(async (reportId: string) => {
+  const loadDetail = useCallback(async (reportId: string, runId?: string) => {
+    const requestId = ++detailRequestRef.current;
     setActiveTab('evaluate');
+    if (runId) setSelectedRunId(runId);
     setSelectedReportId(reportId);
+    setDetail(null);
     setDetailLoading(true);
     try {
       const res = await fetch(`${apiBase}/eval/reports/${reportId}`, { headers });
       if (!res.ok) throw new Error('Failed to load report detail');
-      setDetail(await res.json());
+      const loaded: EvalReportDetail = await res.json();
+      if (requestId !== detailRequestRef.current) return;
+      if (loaded.id !== reportId) throw new Error('Loaded eval report does not match the selection');
+      setDetail(loaded);
       setTimeout(() => detailRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
     } catch (e) {
-      setErrorMsg(String(e));
+      if (requestId === detailRequestRef.current) setErrorMsg(String(e));
     } finally {
-      setDetailLoading(false);
+      if (requestId === detailRequestRef.current) setDetailLoading(false);
     }
   }, [apiBase, headers]);
 
+  function selectRunForEval(runId: string) {
+    detailRequestRef.current += 1;
+    setSelectedRunId(runId);
+    setSelectedReportId(null);
+    setDetail(null);
+    setDetailLoading(false);
+  }
+
   async function runEval(runId: string) {
+    const requestId = ++detailRequestRef.current;
     setRunningEvalFor(runId);
     setErrorMsg('');
+    setSelectedReportId(null);
+    setDetail(null);
     try {
       const res = await fetch(`${apiBase}/runs/${runId}/eval?model=${encodeURIComponent(evalModel)}`, {
         method: 'POST',
@@ -797,11 +826,12 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
         throw new Error(body?.detail ?? `HTTP ${res.status}`);
       }
       const record: EvalReportDetail = await res.json();
+      if (requestId !== detailRequestRef.current) return;
       setDetail(record);
       setSelectedReportId(record.id);
       await load();
     } catch (e) {
-      setErrorMsg(String(e));
+      if (requestId === detailRequestRef.current) setErrorMsg(String(e));
     } finally {
       setRunningEvalFor(null);
     }
@@ -809,15 +839,15 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
 
   async function startResearchRun(
     query: string,
-    mode: string,
     debate: boolean,
+    onProgress: (progress: BenchmarkRunProgress) => void,
   ): Promise<string> {
     const res = await fetch(`${apiBase}/research`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...headers },
       body: JSON.stringify({
         query,
-        mode,
+        mode: 'multi_agent_verified',
         debate,
         model: researchModel || undefined,
         advocate_model: debate ? advocateModel || undefined : undefined,
@@ -827,12 +857,104 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
     if (!res.ok) throw new Error(`Research failed: HTTP ${res.status}`);
 
     let runId = '';
+    let completed = false;
+    let streamError = '';
+    let initialTotal = 0;
+    let initialDone = 0;
+    let gapTotal = 0;
+    let gapDone = 0;
+    let lastPercent = 0;
+
+    const update = (stage: string, detail: string, percent: number) => {
+      lastPercent = Math.max(lastPercent, percent);
+      onProgress({ stage, detail, percent: lastPercent });
+    };
+
     await readStream(res, data => {
-      if (data.type === 'started') runId = data.run_id as string;
-      if (data.type === 'error') throw new Error(data.message as string);
-      if (data.type === 'done') runId = data.run_id as string;
+      const type = data.type as string;
+      if (type === 'started') {
+        runId = data.run_id as string;
+        update('Starting research', 'Creating the research run and checking the query', 4);
+      } else if (type === 'plan_thinking') {
+        update('Planning research', 'The lead model is defining the research strategy', 8);
+      } else if (type === 'plan') {
+        initialTotal = ((data.subtasks as string[]) ?? []).length;
+        update(
+          'Research plan ready',
+          `${initialTotal} research question${initialTotal !== 1 ? 's' : ''} will run in parallel`,
+          12,
+        );
+      } else if (type === 'subtask_done') {
+        const isGap = data.stage === 'gap';
+        const question = String(data.question ?? '');
+        const count = Number(data.findings_count ?? 0);
+        if (isGap) {
+          gapDone += 1;
+          const fraction = gapTotal > 0 ? gapDone / gapTotal : 1;
+          update(
+            'Follow-up research',
+            `${gapDone}/${gapTotal || gapDone} gap questions complete · ${count} findings · ${question}`,
+            78 + fraction * 10,
+          );
+        } else {
+          initialDone += 1;
+          const fraction = initialTotal > 0 ? initialDone / initialTotal : 1;
+          update(
+            'Parallel research',
+            `${initialDone}/${initialTotal || initialDone} questions complete · ${count} findings · ${question}`,
+            14 + fraction * 38,
+          );
+        }
+      } else if (type === 'debating') {
+        update('Adversarial debate', 'Proposition and opposition are reviewing the evidence', 55);
+      } else if (type === 'debate_turn') {
+        const round = Number(data.round ?? 1);
+        const side = data.agent === 'advocate' ? 'Proposition' : 'Opposition';
+        const turnNumber = (round - 1) * 2 + (data.agent === 'advocate' ? 1 : 2);
+        update(
+          'Adversarial debate',
+          `Round ${round} · ${side} completed`,
+          55 + Math.min(turnNumber, 4) / 4 * 15,
+        );
+      } else if (type === 'judging') {
+        update('Judging debate', 'The lead model is weighing both sides', 72);
+      } else if (type === 'debate_verdict') {
+        update('Debate complete', 'The verdict is ready; evidence audit is next', 75);
+      } else if (type === 'evidence_auditing') {
+        update(
+          'Auditing evidence',
+          'Checking coverage, source quality, contradictions, and missing evidence',
+          debate ? 77 : 58,
+        );
+      } else if (type === 'evidence_audit') {
+        const gaps = (data.subtasks as string[]) ?? [];
+        gapTotal = gaps.length;
+        update(
+          gaps.length > 0 ? 'Evidence gaps found' : 'Evidence audit passed',
+          gaps.length > 0
+            ? `${gaps.length} targeted follow-up question${gaps.length !== 1 ? 's' : ''} planned`
+            : String(data.assessment ?? 'Evidence is sufficient for synthesis'),
+          gaps.length > 0 ? 78 : 82,
+        );
+      } else if (type === 'synthesizing') {
+        update('Writing report', 'Synthesizing findings and applying citation discipline', 90);
+      } else if (type === 'report') {
+        update('Report ready', 'Final citation-checked report received', 96);
+      } else if (type === 'clarification_needed') {
+        streamError = 'Benchmark question needs clarification; use a more specific question.';
+        update('Clarification required', streamError, lastPercent);
+      } else if (type === 'error') {
+        streamError = String(data.message ?? 'Research failed');
+        update('Research failed', streamError, lastPercent);
+      } else if (type === 'done') {
+        runId = data.run_id as string;
+        completed = true;
+        update('Research complete', 'Starting report evaluation', 97);
+      }
     });
+    if (streamError) throw new Error(streamError);
     if (!runId) throw new Error('Research stream ended without a run id');
+    if (!completed) throw new Error('Research stream ended before the run completed');
     return runId;
   }
 
@@ -844,35 +966,48 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
     if (questions.length === 0 || benchmarkRunning) return;
 
     const modes = [
-      { label: 'L1 Single Agent', mode: 'single_agent', debate: false },
-      { label: 'L2 Multi-Agent', mode: 'multi_agent_no_compaction', debate: false },
-      { label: 'L3 Compacted', mode: 'multi_agent_compaction', debate: false },
-      { label: 'L4 Citation Checked', mode: 'multi_agent_verified', debate: false },
-      { label: 'L5 Debate + Gap', mode: 'multi_agent_verified', debate: true },
+      { label: 'Standard Research', debate: false },
+      { label: 'Debate Research', debate: true },
     ];
     const total = questions.length * modes.length;
     let done = 0;
 
     setBenchmarkRunning(true);
     setErrorMsg('');
+    setBenchmarkStage('Preparing comparison');
+    setBenchmarkDetail(`${questions.length} question${questions.length !== 1 ? 's' : ''} · ${total} total runs`);
+    setBenchmarkPercent(0);
     try {
       for (const question of questions) {
         for (const mode of modes) {
           setBenchmarkProgress(`${done + 1}/${total} · ${mode.label}`);
-          const runId = await startResearchRun(question, mode.mode, mode.debate);
+          const runId = await startResearchRun(question, mode.debate, progress => {
+            setBenchmarkStage(progress.stage);
+            setBenchmarkDetail(progress.detail ? `${progress.detail} · ${question}` : question);
+            setBenchmarkPercent(Math.round(((done + progress.percent / 100) / total) * 100));
+          });
+          setBenchmarkStage('Evaluating report');
+          setBenchmarkDetail(`${mode.label} complete · scoring grounding, faithfulness, completeness, and relevance`);
+          setBenchmarkPercent(Math.round(((done + 0.98) / total) * 100));
           const evalRes = await fetch(
             `${apiBase}/runs/${runId}/eval?model=${encodeURIComponent(evalModel)}`,
             { method: 'POST', headers },
           );
           if (!evalRes.ok) throw new Error(`Eval failed: HTTP ${evalRes.status}`);
           done += 1;
+          setBenchmarkPercent(Math.round((done / total) * 100));
         }
       }
       setBenchmarkProgress(`Complete · ${done}/${total} runs evaluated`);
+      setBenchmarkStage('Comparison complete');
+      setBenchmarkDetail('Standard and debate results are ready below');
+      setBenchmarkPercent(100);
       await load();
       setActiveTab('benchmark');
     } catch (e) {
       setErrorMsg(String(e));
+      setBenchmarkStage('Comparison stopped');
+      setBenchmarkDetail(String(e));
     } finally {
       setBenchmarkRunning(false);
     }
@@ -885,6 +1020,7 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
       const res = await fetch(`${apiBase}/runs/${runId}`, { method: 'DELETE', headers });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       if (selectedReportId && latestByRun.get(runId)?.id === selectedReportId) {
+        detailRequestRef.current += 1;
         setSelectedReportId(null);
         setDetail(null);
       }
@@ -927,7 +1063,7 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
       <div className="inline-flex rounded-xl border border-gray-200 bg-white p-1 shadow-sm">
         {[
           ['evaluate', 'Evaluate Reports'],
-          ['benchmark', 'Compare Modes'],
+          ['benchmark', 'Compare Debate'],
         ].map(([id, label]) => (
           <button
             key={id}
@@ -952,9 +1088,9 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
             <div className="bg-white border border-gray-200 rounded-2xl shadow-sm p-4">
               <div className="flex items-start justify-between gap-3 flex-wrap">
                 <div>
-                  <p className="text-sm font-semibold text-gray-900">Run Mode Comparison</p>
+                  <p className="text-sm font-semibold text-gray-900">Standard vs Debate</p>
                   <p className="text-xs text-gray-400 mt-0.5">
-                    Runs each question through five quality levels, then evaluates every result.
+                    Runs each question once normally and once with experimental debate, then compares the results.
                   </p>
                 </div>
                 <button
@@ -963,20 +1099,17 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
                   className="inline-flex items-center gap-1.5 rounded-lg bg-gray-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-gray-800 disabled:opacity-50 disabled:cursor-default transition-colors"
                 >
                   {benchmarkRunning && <Spinner />}
-                  {benchmarkRunning ? 'Running…' : 'Run L1-L5'}
+                  {benchmarkRunning ? 'Running…' : 'Compare Debate'}
                 </button>
               </div>
 
-              <div className="grid gap-2 sm:grid-cols-5 mt-4">
+              <div className="grid gap-2 sm:grid-cols-2 mt-4">
                 {[
-                  ['L1', 'Single agent baseline'],
-                  ['L2', 'Parallel agents'],
-                  ['L3', 'Adds compaction'],
-                  ['L4', 'Adds citation check'],
-                  ['L5', 'Adds debate + gap research'],
-                ].map(([level, text]) => (
-                  <div key={level} className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-2">
-                    <p className="text-xs font-bold text-gray-900">{level}</p>
+                  ['Standard Research', 'Parallel research, evidence audit, and citation checks'],
+                  ['Debate Research', 'The same pipeline with adversarial review before the audit'],
+                ].map(([label, text]) => (
+                  <div key={label} className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-2">
+                    <p className="text-xs font-bold text-gray-900">{label}</p>
                     <p className="text-[11px] text-gray-500 mt-0.5 leading-snug">{text}</p>
                   </div>
                 ))}
@@ -1029,7 +1162,7 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
                   </div>
                   <div>
                     <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-1">
-                      L5 Advocate
+                      Debate Advocate
                     </p>
                     <CustomSelect
                       options={modelOptions}
@@ -1040,7 +1173,7 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
                   </div>
                   <div>
                     <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-1">
-                      L5 Skeptic
+                      Debate Skeptic
                     </p>
                     <CustomSelect
                       options={modelOptions}
@@ -1060,16 +1193,37 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
                 </div>
               </div>
               {benchmarkProgress && (
-                <p className="mt-3 text-xs font-medium text-gray-500">{benchmarkProgress}</p>
+                <div className="mt-4 rounded-xl border border-blue-100 bg-blue-50/60 px-3.5 py-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-xs font-semibold text-gray-800">
+                        {benchmarkRunning && <span className="inline-block mr-1.5"><Spinner /></span>}
+                        {benchmarkStage || 'Preparing comparison'}
+                      </p>
+                      <p className="text-[11px] text-gray-500 mt-0.5 truncate">
+                        {benchmarkProgress}{benchmarkDetail ? ` · ${benchmarkDetail}` : ''}
+                      </p>
+                    </div>
+                    <span className="text-xs font-bold tabular-nums text-blue-700">
+                      {benchmarkPercent}%
+                    </span>
+                  </div>
+                  <div className="mt-2.5 h-1.5 rounded-full bg-blue-100 overflow-hidden">
+                    <div
+                      className="h-full rounded-full bg-blue-600 transition-[width] duration-500 ease-out"
+                      style={{ width: `${benchmarkPercent}%` }}
+                    />
+                  </div>
+                </div>
               )}
             </div>
 
             <div className="bg-white border border-gray-200 rounded-2xl shadow-sm overflow-hidden">
               <div className="px-4 pt-4 pb-3 border-b border-gray-100 flex items-start justify-between gap-3">
                 <div>
-                  <p className="text-sm font-semibold text-gray-900">Mode Comparison Results</p>
+                  <p className="text-sm font-semibold text-gray-900">Debate Comparison Results</p>
                   <p className="text-xs text-gray-400 mt-0.5">
-                    Averages across your evaluated runs, grouped by the mode stored at run completion.
+                    Averages across evaluated standard and debate runs.
                   </p>
                 </div>
                 {benchmarkRows.length > 0 && (
@@ -1138,7 +1292,7 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
                   description: 'Start a research run first',
                 }]}
                 value={selectedRun?.id ?? ''}
-                onChange={setSelectedRunId}
+                onChange={selectRunForEval}
                 disabled={runs.length === 0}
               />
               <div className="flex items-center gap-2 justify-end">
@@ -1235,7 +1389,7 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
                             <div className="flex items-center justify-end gap-3">
                               {latest ? (
                                 <button
-                                  onClick={() => loadDetail(latest.id)}
+                                  onClick={() => loadDetail(latest.id, run.id)}
                                   className="text-xs font-semibold text-blue-600 hover:text-blue-800 transition-colors"
                                 >
                                   View
@@ -1274,7 +1428,10 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
           {activeTab === 'evaluate' && (
           <div ref={detailRef} className="bg-white border border-gray-200 rounded-2xl shadow-sm p-4">
             <p className="text-sm font-semibold text-gray-900 mb-3">Report Detail</p>
-            <DetailPanel detail={detail} loading={detailLoading} />
+            <DetailPanel
+              detail={detail?.id === selectedReportId ? detail : null}
+              loading={detailLoading}
+            />
           </div>
           )}
 

@@ -31,8 +31,6 @@ from engine.state import (
 )
 from engine.usage import usage_from_message
 
-MAX_GAP_QUESTIONS = 5
-
 # Display names for the two debate sides — the underlying `agent` field stays
 # "advocate" | "skeptic" (model selection, SSE routing), but everything the
 # debaters/judge say and everything the UI shows uses this consistent wording.
@@ -221,76 +219,3 @@ def judge_debate(state: ResearchState) -> dict[str, object]:
     winner = result.winner if result else "draw"
     verdict = DebateVerdict(rows=rows, winner=winner, model=model)
     return {"debate_verdict": verdict, "token_usage": [usage] if usage else []}
-
-
-# ---------------------------------------------------------------------------
-# Debate-driven gap research: after the final round, the (neutral) lead model
-# distills the skeptic's unresolved objections into concrete follow-up search
-# questions. A second subagent fan-out researches them before synthesis, so
-# the report answers the debate's open questions with evidence instead of
-# leaving them as caveats.
-# ---------------------------------------------------------------------------
-
-class GapResearchPlan(BaseModel):
-    thinking: str  # Brief reasoning: which objections survived rebuttal and need evidence
-    gap_questions: list[str]
-
-
-_GAP_PROMPT = ChatPromptTemplate.from_messages([
-    (
-        "system",
-        "You are a neutral research lead reviewing an adversarial debate over a "
-        "research summary. Identify the evidence GAPS that block a confident "
-        "answer: objections the opposition raised that the proposition could not "
-        "rebut with the existing findings, and facts both sides agreed were "
-        "missing.\n"
-        f"- In 'gap_questions': write 0–{MAX_GAP_QUESTIONS} follow-up research "
-        "questions targeting those gaps. Each must be self-contained, concrete, "
-        "and directly answerable via a web search (name the specific data, "
-        "comparison, or timeframe needed). Each question is sent VERBATIM to a web "
-        "search engine as the query, so keep it short — one sentence, ideally under "
-        "20 words.\n"
-        "- Do NOT re-ask what the summary already answers, and do not restate "
-        "debate rhetoric — only genuinely missing evidence qualifies.\n"
-        "- Prioritize empty original subtasks when they are central to the user's "
-        "question, especially missing comparison legs (for example, one company "
-        "in a 'A vs B' query).\n"
-        "- If the debate surfaced no material gaps, return an empty list.",
-    ),
-    (
-        "human",
-        "Research query: {query}\n\nResearch summary:\n{summary}\n\n"
-        "Original planned subtasks:\n{original_subtasks}\n\n"
-        "Original subtasks with zero findings:\n{empty_subtasks}\n\n"
-        "Debate transcript:\n{transcript}",
-    ),
-])
-
-
-def plan_gap_research(state: ResearchState) -> dict[str, object]:
-    """Distill unresolved debate objections into follow-up search questions (debate mode)."""
-    model = state.get("lead_model", LEAD_MODEL)
-    llm = make_chat_model(model, temperature=0)
-    chain = _GAP_PROMPT | llm.with_structured_output(
-        GapResearchPlan, include_raw=True, **structured_output_kwargs(model)
-    )
-    findings = state.get("findings", [])
-    answered_subtasks = {f["subtask"] for f in findings}
-    empty_subtasks = [q for q in state.get("subtasks", []) if q not in answered_subtasks]
-    raw = chain.invoke({
-        "query": state["query"],
-        "summary": state.get("summary", ""),
-        "original_subtasks": "\n".join(f"- {q}" for q in state.get("subtasks", [])),
-        "empty_subtasks": "\n".join(f"- {q}" for q in empty_subtasks) or "(none)",
-        "transcript": format_transcript(state.get("debate_turns", [])),
-    })
-    assert isinstance(raw, dict)  # include_raw=True returns {"raw", "parsed", "parsing_error"}
-    result: GapResearchPlan | None = raw["parsed"]
-    usage = usage_from_message(raw["raw"], "plan_gap_research", model)
-    # A parsing failure (model replied without the structured tool call) is rare
-    # but not fatal — treat it the same as "no material gaps" rather than crashing.
-    gap_questions = result.gap_questions[:MAX_GAP_QUESTIONS] if result else []
-    return {
-        "gap_subtasks": gap_questions,
-        "token_usage": [usage] if usage else [],
-    }
