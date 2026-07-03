@@ -84,6 +84,30 @@ class RelevanceResult(BaseModel):
     reasoning: str
 
 
+class SourceAuthorityVerdict(BaseModel):
+    """Authority tier for one unique cited source domain."""
+
+    url: str
+    domain: str
+    tier: Literal["primary", "secondary", "other"]
+    reasoning: str
+
+
+class SourceAuthorityResult(BaseModel):
+    """Source authority: how much of the evidence base is primary/official?
+
+    Grounding proves the quote is on the page; this scores whether the pages
+    are worth quoting. Weighted mean over unique cited domains
+    (primary 1.0 / secondary 0.6 / other 0.2). Informational — never fails a run.
+    """
+
+    verdicts: list[SourceAuthorityVerdict]
+    authority_score: float  # 0-1 weighted mean over unique domains
+    primary_count: int
+    secondary_count: int
+    other_count: int
+
+
 class RagChunkVerdict(BaseModel):
     """LLM-judge verdict for one retrieved chunk's relevance to the question."""
 
@@ -199,6 +223,7 @@ class EvalReport(BaseModel):
     citation_coverage: CitationCoverageResult
     completeness: CompletenessResult
     relevance: RelevanceResult
+    source_authority: SourceAuthorityResult
 
     total_findings: int
     ungrounded_count: int
@@ -260,6 +285,18 @@ class EvalReport(BaseModel):
         lines += [
             "",
             f"Relevance: {self.relevance.score}/5 — {self.relevance.reasoning}",
+            "",
+            f"Source authority: {self.source_authority.authority_score:.0%} "
+            f"(primary {self.source_authority.primary_count} / "
+            f"secondary {self.source_authority.secondary_count} / "
+            f"other {self.source_authority.other_count} "
+            f"of {len(self.source_authority.verdicts)} domains)",
+        ]
+        for v in self.source_authority.verdicts:
+            if v.tier == "other":
+                lines.append(f"    - other: {v.domain} — {v.reasoning}")
+
+        lines += [
             "",
             f"Eval cost: ${self.eval_cost_usd:.4f} ({self.eval_model}, "
             f"{self.eval_input_tokens + self.eval_output_tokens} tokens)",

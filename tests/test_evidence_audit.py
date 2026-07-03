@@ -102,3 +102,69 @@ def test_evidence_audit_can_use_optional_debate_transcript(
 
     assert result["gap_subtasks"] == []
     assert "[Round 1 — Opposition]" in str(captured["transcript"])
+
+
+def _finding(subtask: str, url: str) -> dict[str, str]:
+    return {
+        "subtask": subtask,
+        "claim": "A supported claim",
+        "evidence_span": "Evidence",
+        "citation_url": url,
+    }
+
+
+def _run_audit_capturing_inputs(
+    monkeypatch: pytest.MonkeyPatch, state: ResearchState
+) -> dict[str, object]:
+    import engine.nodes.evidence_audit as audit_mod
+
+    captured: dict[str, object] = {}
+    parsed = MagicMock(sufficient=True, assessment="ok", gap_questions=[])
+    raw_msg = MagicMock()
+    raw_msg.usage_metadata = None
+    mock_chain = MagicMock()
+    mock_chain.invoke = lambda inputs: (
+        captured.update(inputs),
+        {"raw": raw_msg, "parsed": parsed},
+    )[1]
+    mock_llm = MagicMock()
+    mock_llm.with_structured_output = MagicMock(return_value=MagicMock())
+    monkeypatch.setattr(audit_mod, "make_chat_model", lambda *a, **kw: mock_llm)
+    mock_prompt = MagicMock()
+    mock_prompt.__or__ = lambda s, o: mock_chain
+    monkeypatch.setattr(audit_mod, "_PROMPT", mock_prompt)
+
+    audit_mod.evidence_audit(state)
+    return captured
+
+
+def test_evidence_audit_warns_on_low_source_diversity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    findings = [
+        _finding("Singapore obligations", "https://aggregator.example.com/page")
+        for _ in range(5)
+    ]
+    captured = _run_audit_capturing_inputs(monkeypatch, _state(findings=findings))
+
+    assert "WARNING" in str(captured["sources"])
+    assert "only 1 distinct domain(s)" in str(captured["sources"])
+    assert "Singapore obligations: 5 findings from 1 source domain(s)" in str(
+        captured["coverage"]
+    )
+
+
+def test_evidence_audit_no_warning_when_sources_are_diverse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    findings = [
+        _finding("Singapore obligations", "https://www.imda.gov.sg/framework"),
+        _finding("Singapore obligations", "https://www.pdpc.gov.sg/guidance"),
+        _finding("EU obligations", "https://eur-lex.europa.eu/ai-act"),
+    ]
+    captured = _run_audit_capturing_inputs(monkeypatch, _state(findings=findings))
+
+    assert "WARNING" not in str(captured["sources"])
+    assert "Singapore obligations: 2 findings from 2 source domain(s)" in str(
+        captured["coverage"]
+    )

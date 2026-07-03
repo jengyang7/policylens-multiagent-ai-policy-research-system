@@ -197,6 +197,7 @@ def _eval_record_summary(record: EvalReportRecord) -> dict[str, object]:
         "eval_cost_usd": record.eval_cost_usd,
         "recall_score": record.recall_score,
         "relevance_score": record.relevance_score,
+        "authority_score": record.authority_score,
     }
 
 
@@ -719,6 +720,7 @@ async def run_eval(
         eval_cost_usd=eval_report.eval_cost_usd,
         recall_score=eval_report.completeness.recall_score,
         relevance_score=eval_report.relevance.score,
+        authority_score=eval_report.source_authority.authority_score,
         report=eval_report.model_dump(mode="json"),
     )
     async with _session_factory() as session:
@@ -747,12 +749,14 @@ async def global_eval_summary() -> dict[str, object]:
         func.coalesce(func.sum(EvalReportRecord.unfaithful_count), 0),
         func.coalesce(func.sum(EvalReportRecord.recall_score), 0.0),
         func.coalesce(func.sum(EvalReportRecord.relevance_score), 0),
+        func.coalesce(func.sum(EvalReportRecord.authority_score), 0.0),
     )
     async with _session_factory() as session:
         result = await session.execute(stmt)
         (
             runs_evaluated, passed_count, total_findings, ungrounded_count,
             total_citations, unfaithful_count, recall_sum, relevance_sum,
+            authority_sum,
         ) = result.one()
 
     grounded = total_findings - ungrounded_count
@@ -764,6 +768,7 @@ async def global_eval_summary() -> dict[str, object]:
         "faithfulness_rate": (faithful / total_citations * 100) if total_citations else None,
         "completeness_rate": (recall_sum / runs_evaluated * 100) if runs_evaluated else None,
         "relevance_score": (relevance_sum / runs_evaluated) if runs_evaluated else None,
+        "authority_rate": (authority_sum / runs_evaluated * 100) if runs_evaluated else None,
     }
 
 

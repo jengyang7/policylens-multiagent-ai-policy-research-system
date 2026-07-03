@@ -30,9 +30,21 @@ _LANGGRAPH_TABLES = {
     "checkpoints", "checkpoint_blobs", "checkpoint_writes", "checkpoint_migrations"
 }
 
+# LlamaIndex's PGVectorStore creates its own tables with a "data_" prefix
+# (data_report_chunks). They live outside SQLAlchemy metadata, so autogenerate
+# sees them as "removed" and emits a drop_table — which once deleted the whole
+# RAG embedding store. Never let autogenerate touch them.
+_EXTERNAL_TABLE_PREFIX = "data_"
+
 
 def _include_object(obj, name, type_, reflected, compare_to):  # type: ignore[no-untyped-def]
-    if type_ == "table" and name in _LANGGRAPH_TABLES:
+    if type_ == "table" and (
+        name in _LANGGRAPH_TABLES or name.startswith(_EXTERNAL_TABLE_PREFIX)
+    ):
+        return False
+    if type_ == "index" and getattr(
+        getattr(obj, "table", None), "name", ""
+    ).startswith(_EXTERNAL_TABLE_PREFIX):
         return False
     return True
 

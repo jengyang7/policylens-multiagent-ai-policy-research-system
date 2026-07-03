@@ -8,6 +8,7 @@ There is deliberately no unrestricted reflection loop.
 from __future__ import annotations
 
 from collections import Counter
+from urllib.parse import urlparse
 
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel
@@ -18,6 +19,12 @@ from engine.state import EvidenceAuditResult, ResearchState
 from engine.usage import usage_from_message
 
 MAX_GAP_QUESTIONS = 3
+
+# Below this many distinct source domains across all findings, the audit input
+# carries an explicit low-diversity warning: a report resting on one or two
+# pages is exactly the failure the audit exists to catch, and the LLM judge
+# has missed it when left to infer diversity from a bare URL list.
+MIN_DISTINCT_DOMAINS = 3
 
 
 class EvidenceAuditDecision(BaseModel):
@@ -38,7 +45,11 @@ _PROMPT = ChatPromptTemplate.from_messages([
         "- coverage of every material planned sub-question, especially subtasks "
         "with zero findings\n"
         "- authority and diversity of sources, preferring primary laws, regulators, "
-        "courts, standards bodies, and official guidance\n"
+        "courts, standards bodies, and official guidance. Evidence drawn from "
+        f"fewer than {MIN_DISTINCT_DOMAINS} distinct domains, or a subtask "
+        "answered entirely by a single non-official source (aggregator, blog, "
+        "content site), is normally insufficient — emit gap questions that "
+        "explicitly target primary/official sources for those claims\n"
         "- missing jurisdictions, comparison legs, legal status, dates, affected "
         "actors, obligations, exceptions, enforcement, or practical implications "
         "that the query specifically requires\n"
@@ -62,17 +73,42 @@ _PROMPT = ChatPromptTemplate.from_messages([
 ])
 
 
+def _domain(url: str) -> str:
+    hostname = (urlparse(url).hostname or "").lower()
+    return hostname.removeprefix("www.")
+
+
 def _coverage_text(state: ResearchState) -> str:
-    counts = Counter(f["subtask"] for f in state.get("findings", []))
+    findings = state.get("findings", [])
+    counts = Counter(f["subtask"] for f in findings)
+    domains: dict[str, set[str]] = {}
+    for f in findings:
+        domains.setdefault(f["subtask"], set()).add(_domain(f["citation_url"]))
     subtasks = state.get("subtasks", [])
     if not subtasks:
         return "(no planned subtasks)"
-    return "\n".join(f"- {question}: {counts[question]} findings" for question in subtasks)
+    return "\n".join(
+        f"- {question}: {counts[question]} findings"
+        f" from {len(domains.get(question, set()))} source domain(s)"
+        for question in subtasks
+    )
 
 
 def _source_text(state: ResearchState) -> str:
-    urls = list(dict.fromkeys(f["citation_url"] for f in state.get("findings", [])))
-    return "\n".join(f"- {url}" for url in urls) or "(no sources)"
+    findings = state.get("findings", [])
+    urls = list(dict.fromkeys(f["citation_url"] for f in findings))
+    if not urls:
+        return "(no sources)"
+    lines = [f"- {url}" for url in urls]
+    distinct = {_domain(url) for url in urls}
+    if len(distinct) < MIN_DISTINCT_DOMAINS:
+        lines.append(
+            f"\nWARNING: all {len(findings)} findings come from only "
+            f"{len(distinct)} distinct domain(s). Treat source diversity as "
+            "materially insufficient unless the query is answerable from a "
+            "single authoritative source."
+        )
+    return "\n".join(lines)
 
 
 def evidence_audit(state: ResearchState) -> dict[str, object]:

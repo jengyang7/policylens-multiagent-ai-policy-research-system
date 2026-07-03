@@ -53,3 +53,45 @@ def test_search_reports_unknown_provider(monkeypatch: pytest.MonkeyPatch) -> Non
 
     with pytest.raises(RuntimeError, match="unknown: unknown provider"):
         search_mod.search("query")
+
+
+def test_search_enforces_include_domains_client_side(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Providers treat include_domains as a hint — off-domain results must be
+    dropped so official-source specs actually return official sources."""
+    import engine.tools.search as search_mod
+
+    mixed_results = [
+        {"url": "https://digital.nemko.com/regulations/singapore", "provider": "tavily"},
+        {"url": "https://www.pdpc.gov.sg/framework.pdf", "provider": "tavily"},
+        {"url": "https://securiti.ai/singapore-framework", "provider": "tavily"},
+        {"url": "https://sub.imda.gov.sg/guidance", "provider": "tavily"},
+    ]
+    monkeypatch.setattr(search_mod, "_provider_order", lambda: ["tavily"])
+    monkeypatch.setattr(
+        search_mod, "_search_tavily", lambda query, max_results, include_domains: mixed_results
+    )
+
+    results = search_mod.search(
+        "Singapore AI governance", include_domains=["imda.gov.sg", "pdpc.gov.sg"]
+    )
+
+    assert [r["url"] for r in results] == [
+        "https://www.pdpc.gov.sg/framework.pdf",
+        "https://sub.imda.gov.sg/guidance",
+    ]
+
+
+def test_search_without_include_domains_keeps_all_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import engine.tools.search as search_mod
+
+    results_in = [{"url": "https://anywhere.example.com/page", "provider": "tavily"}]
+    monkeypatch.setattr(search_mod, "_provider_order", lambda: ["tavily"])
+    monkeypatch.setattr(
+        search_mod, "_search_tavily", lambda query, max_results, include_domains: results_in
+    )
+
+    assert search_mod.search("anything") == results_in

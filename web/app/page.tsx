@@ -90,11 +90,10 @@ const CLIENT_ID_KEY = 'dra_client_id_v1';
 
 // Clickable starter queries on the New Policy Research page — click to research immediately
 const SUGGESTED_QUERIES = [
-  'How is Singapore regulating AI governance and model risk in 2026?',
-  'What obligations does the EU AI Act create for high-risk AI systems?',
-  'How are the US, EU, and UK regulating frontier AI models?',
-  'What AI transparency rules affect generative AI providers in 2026?',
-  'What are the main AI copyright lawsuits and policy risks?',
+  'Could Singapore\'s light-touch AI governance become the model other APAC regulators copy — or is it a liability magnet?',
+  'If a Singapore startup trains a frontier model and sells it into the EU, whose AI rules win?',
+  'How does China\'s AI regulation compare to the EU\'s risk-tiered approach — convergence or divergence?',
+  'When an AI system trained in one country causes harm in another, who\'s actually liable?',
 ];
 
 // ---------------------------------------------------------------------------

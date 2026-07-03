@@ -31,8 +31,9 @@ FUZZY_MATCH_THRESHOLD = 0.85
 _MIN_LEN_FOR_FUZZY = 20
 
 # Grounding only does string matching (no LLM context window to bound), so allow
-# a much larger page slice than the subagent's extraction fetch (8K chars) — a
-# match further down a long page shouldn't register as ungrounded.
+# a much larger page slice than the subagent's extraction window — a match
+# further down a long page shouldn't register as ungrounded. Must stay a
+# superset of engine/nodes/subagent.py's _EXTRACT_CHARS.
 _GROUNDING_MAX_CHARS = 40_000
 _default_grounding_fetch: Callable[[str], str] = partial(
     default_fetch, max_chars=_GROUNDING_MAX_CHARS

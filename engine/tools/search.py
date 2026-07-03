@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from tavily import TavilyClient
@@ -9,6 +10,15 @@ from tavily import TavilyClient
 # Tavily rejects queries over 400 characters with a 400 error.
 _MAX_QUERY_LENGTH = 400
 _EXA_SEARCH_URL = "https://api.exa.ai/search"
+
+
+def _matches_include_domains(url: str, include_domains: list[str]) -> bool:
+    hostname = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    for domain in include_domains:
+        wanted = domain.lower().removeprefix("www.")
+        if hostname == wanted or hostname.endswith("." + wanted):
+            return True
+    return False
 
 
 def _provider_order() -> list[str]:
@@ -129,6 +139,17 @@ def search(
                 failures.append(f"{provider}: unknown provider")
         except Exception as exc:
             failures.append(f"{provider}: {exc}")
+
+    # Providers treat include_domains as a hint, not a guarantee — Tavily
+    # demonstrably returns off-domain results for a query restricted to four
+    # .gov.sg domains. Enforce the restriction here so domain-restricted specs
+    # (official regulator sources) actually return only those domains; an
+    # empty result just means the caller falls through to its next spec.
+    if include_domains:
+        results = [
+            r for r in results
+            if _matches_include_domains(str(r.get("url", "")), include_domains)
+        ]
 
     deduped = _dedupe(results, max_results)
     if deduped:

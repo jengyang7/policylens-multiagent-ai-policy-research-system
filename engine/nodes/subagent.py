@@ -7,7 +7,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 
 from engine.extraction import FindingList
-from engine.models import SUBAGENT_MODEL
+from engine.models import SUBAGENT_ESCALATION_MODEL, SUBAGENT_MODEL
 from engine.state import SubagentInput, SubtaskFinding, TokenUsage
 from engine.tools.fetch import fetch
 from engine.tools.search import search
@@ -134,10 +134,53 @@ _AI_POLICY_DOMAINS = [
 
 _SKIP_FINDING_DOMAINS = {
     "youtube.com",
-    "www.youtube.com",
-    "m.youtube.com",
     "youtu.be",
+    "linkedin.com",
 }
+
+# One page must not monopolize a subtask's evidence: without a cap, the first
+# productive URL can supply every finding and the whole report ends up citing
+# one or two sources.
+_MAX_FINDINGS_PER_URL = 8
+
+# How much of a fetched page the extraction LLM sees. Marketing-heavy pages
+# bury the substance past the old 6K window (observed: content starting at
+# char ~10,500), which made the extractor return zero findings from pages that
+# actually answered the question. Must stay well under eval/grounding's
+# 40K-char re-fetch slice so extracted spans remain findable at eval time.
+_EXTRACT_CHARS = 16_000
+
+# Keep trying later search specs until the subtask's findings span at least
+# this many distinct domains (or specs run out) — a single-domain evidence
+# base defeats the evidence audit's source-diversity check downstream.
+_MIN_SOURCE_DOMAINS = 2
+
+# Pages shorter than this that yield zero findings are probably genuinely
+# irrelevant; longer empty pages trigger one retry on the escalation model.
+_ESCALATION_MIN_CHARS = 2_000
+
+
+def _domain(url: str) -> str:
+    hostname = (urlparse(url).hostname or "").lower()
+    return hostname.removeprefix("www.")
+
+
+def _matches_domain(hostname: str, domain: str) -> bool:
+    return hostname == domain or hostname.endswith("." + domain)
+
+
+def _prioritized_results(
+    results: list[dict[str, object]], priority_domains: list[str]
+) -> list[dict[str, object]]:
+    """Stable-sort search results so priority (official/primary) domains are
+    extracted first — aggregator and content-farm pages only fill remaining
+    per-URL/domain budget after regulator and legislative sources."""
+    if not priority_domains:
+        return results
+    def rank(result: dict[str, object]) -> int:
+        hostname = _domain(str(result.get("url", "")))
+        return 0 if any(_matches_domain(hostname, d) for d in priority_domains) else 1
+    return sorted(results, key=rank)
 
 
 def _should_skip_source(url: str) -> bool:
@@ -146,10 +189,14 @@ def _should_skip_source(url: str) -> bool:
     Findings are later re-fetched by the grounding eval. Video pages can produce
     transcript text for one fetcher/provider and only page chrome for another,
     which creates exactly the "ungrounded YouTube evidence span" failure seen in
-    the eval report. Prefer durable text pages for policy/legal findings.
+    the eval report. LinkedIn posts are login-walled, so the eval's independent
+    re-fetch gets a login page and marks the finding ungrounded — and they're
+    weak authority for policy/legal claims anyway. Prefer durable text pages.
+    Matched by domain suffix so subdomains (m.youtube.com, sg.linkedin.com)
+    are covered without enumeration.
     """
-    hostname = (urlparse(url).hostname or "").lower()
-    return hostname in _SKIP_FINDING_DOMAINS
+    hostname = _domain(url)
+    return any(_matches_domain(hostname, d) for d in _SKIP_FINDING_DOMAINS)
 
 
 def _is_finance_question(question: str) -> bool:
@@ -165,20 +212,36 @@ def _is_ai_policy_question(question: str) -> bool:
 def _search_specs(question: str) -> list[SearchSpec]:
     """Fallback query variants for sparse/zero-result subtasks.
 
-    Keep the first query generic, then add domain/category hints for investment
-    questions where ordinary web search often returns thin news snippets instead
-    of valuation, financial, liquidity, or risk data.
+    For AI-policy questions the official-domain specs come FIRST, so primary
+    sources (regulators, legislation, standards bodies) are searched and
+    extracted before the open web — an aggregator page found by a generic
+    query must not become the subtask's main source. Domain/category hints
+    for investment questions stay after the generic queries, where ordinary
+    web search often returns thin news snippets instead of valuation,
+    financial, liquidity, or risk data.
     """
     specs = [
         SearchSpec(question),
         SearchSpec(f"{question} latest 2026"),
     ]
     if _is_ai_policy_question(question):
-        specs.extend([
+        official_specs = [
             SearchSpec(
                 f"{question} official regulator guidance law obligations effective date",
                 include_domains=_AI_POLICY_DOMAINS,
             ),
+        ]
+        if "singapore" in question.lower():
+            official_specs.append(SearchSpec(
+                f"{question} Singapore IMDA PDPC MAS official AI governance",
+                include_domains=[
+                    "imda.gov.sg",
+                    "pdpc.gov.sg",
+                    "mas.gov.sg",
+                    "mddi.gov.sg",
+                ],
+            ))
+        specs = official_specs + specs + [
             SearchSpec(
                 f"{question} compliance obligations affected entities enforcement",
                 include_domains=_AI_POLICY_DOMAINS,
@@ -187,18 +250,9 @@ def _search_specs(question: str) -> list[SearchSpec]:
                 f"{question} policy analysis legal update",
                 category="news",
             ),
-        ])
+        ]
         if "singapore" in question.lower():
             specs.extend([
-                SearchSpec(
-                    f"{question} Singapore IMDA PDPC MAS official AI governance",
-                    include_domains=[
-                        "imda.gov.sg",
-                        "pdpc.gov.sg",
-                        "mas.gov.sg",
-                        "mddi.gov.sg",
-                    ],
-                ),
                 SearchSpec(
                     f"{question} Singapore AI Verify Foundation sandbox consultation industry",
                     include_domains=[
@@ -260,18 +314,59 @@ def subagent(state: SubagentInput) -> dict[str, object]:
     back into ResearchState.findings via the operator.add reducer.
     """
     question = state["question"]
-    llm: ChatOpenAI = ChatOpenAI(model=SUBAGENT_MODEL, temperature=0)
-    chain = _PROMPT | llm.with_structured_output(
-        FindingList, method="function_calling", include_raw=True
-    )
+
+    def build_chain(model: str):  # type: ignore[no-untyped-def]  # LangChain chain types are unwieldy
+        llm = ChatOpenAI(model=model, temperature=0)
+        return _PROMPT | llm.with_structured_output(
+            FindingList, method="function_calling", include_raw=True
+        )
+
+    chain = build_chain(SUBAGENT_MODEL)
+    escalation_chain = build_chain(SUBAGENT_ESCALATION_MODEL)
 
     findings: list[SubtaskFinding] = []
-    input_tokens = output_tokens = cached_tokens = 0
+    usage_totals: dict[str, list[int]] = {}  # model -> [input, output, cached]
     searched_results: list[dict[str, object]] = []
     processed_urls: set[str] = set()
 
+    def extract_page(page_chain, model: str, url: str, content: str) -> list[SubtaskFinding]:  # type: ignore[no-untyped-def]
+        """One extraction call over one page; returns grounded findings, capped."""
+        try:
+            raw = page_chain.invoke(
+                {"question": question, "url": url, "content": content[:_EXTRACT_CHARS]}
+            )
+            usage = usage_from_message(raw["raw"], "subagent", model)
+            if usage:
+                totals = usage_totals.setdefault(model, [0, 0, 0])
+                totals[0] += usage["input_tokens"]
+                totals[1] += usage["output_tokens"]
+                totals[2] += usage["cached_tokens"]
+            extracted: FindingList | None = raw["parsed"]
+            if extracted is None:
+                return []
+            kept: list[SubtaskFinding] = []
+            for f in extracted.findings:
+                if len(kept) >= _MAX_FINDINGS_PER_URL:
+                    break
+                finding = SubtaskFinding(
+                    subtask=question,
+                    claim=f.claim,
+                    evidence_span=f.evidence_span,
+                    citation_url=str(f.citation_url),
+                )
+                # Self-check (anti-hallucination): run the same grounding check the
+                # eval harness runs later, against the content this LLM actually saw.
+                # Drops findings whose evidence_span isn't a real quote from the page
+                # before they ever reach synthesis — keeps ungrounded_count near zero
+                # for any topic, not just this one.
+                if check_grounding(finding, content[:_EXTRACT_CHARS]).grounded:
+                    kept.append(finding)
+            return kept
+        except Exception:
+            # Silently drop unextractable sources; don't let one bad page fail the subtask
+            return []
+
     def extract_from_results(results: list[dict[str, object]]) -> None:
-        nonlocal input_tokens, output_tokens, cached_tokens
         for result in results:
             url = str(result.get("url", ""))
             if not url:
@@ -285,41 +380,28 @@ def subagent(state: SubagentInput) -> dict[str, object]:
             # Only extract from sources we can fetch ourselves: a finding cited to a URL
             # whose page we can't retrieve can never pass the grounding eval (which
             # independently re-fetches citation_url), so skip rather than fall back to
-            # Tavily's cached snippet.
-            content: str = fetch(url)
+            # Tavily's cached snippet. fetch() returns "" on errors, but one bad page
+            # must never crash the whole subtask, so guard the call as well.
+            try:
+                content: str = fetch(url)
+            except Exception:
+                continue
             if not content:
                 continue
 
-            try:
-                raw = chain.invoke(
-                    {"question": question, "url": url, "content": content[:6_000]}
+            kept = extract_page(chain, SUBAGENT_MODEL, url, content)
+            if not kept and len(content) >= _ESCALATION_MIN_CHARS:
+                # The cheap model is erratic on long pages — observed returning an
+                # empty FindingList on the official PDPC framework PDF that the
+                # stronger model extracted 11 findings from. Retry this one page
+                # on the escalation model before giving up on it: bounded to one
+                # extra call per substantial-but-empty page.
+                kept = extract_page(
+                    escalation_chain, SUBAGENT_ESCALATION_MODEL, url, content
                 )
-                usage = usage_from_message(raw["raw"], "subagent", SUBAGENT_MODEL)
-                if usage:
-                    input_tokens += usage["input_tokens"]
-                    output_tokens += usage["output_tokens"]
-                    cached_tokens += usage["cached_tokens"]
-                extracted: FindingList | None = raw["parsed"]
-                if extracted is None:
-                    continue
-                for f in extracted.findings:
-                    finding = SubtaskFinding(
-                        subtask=question,
-                        claim=f.claim,
-                        evidence_span=f.evidence_span,
-                        citation_url=str(f.citation_url),
-                    )
-                    # Self-check (anti-hallucination): run the same grounding check the
-                    # eval harness runs later, against the content this LLM actually saw.
-                    # Drops findings whose evidence_span isn't a real quote from the page
-                    # before they ever reach synthesis — keeps ungrounded_count near zero
-                    # for any topic, not just this one.
-                    if check_grounding(finding, content[:6_000]).grounded:
-                        findings.append(finding)
-            except Exception:
-                # Silently drop unextractable sources; don't let one bad page fail the subtask
-                continue
+            findings.extend(kept)
 
+    priority_domains = _AI_POLICY_DOMAINS if _is_ai_policy_question(question) else []
     for spec in _search_specs(question):
         try:
             searched_results.extend(
@@ -332,17 +414,19 @@ def subagent(state: SubagentInput) -> dict[str, object]:
             )
         except Exception:
             continue
-        results = _dedupe_results(searched_results)
+        results = _prioritized_results(_dedupe_results(searched_results), priority_domains)
         extract_from_results(results)
-        if findings:
+        if len({_domain(f["citation_url"]) for f in findings}) >= _MIN_SOURCE_DOMAINS:
             break
 
-    token_usage: list[TokenUsage] = []
-    if input_tokens or output_tokens:
-        token_usage.append(TokenUsage(
-            node="subagent", model=SUBAGENT_MODEL,
-            input_tokens=input_tokens, output_tokens=output_tokens, cached_tokens=cached_tokens,
-        ))
+    token_usage: list[TokenUsage] = [
+        TokenUsage(
+            node="subagent", model=model,
+            input_tokens=totals[0], output_tokens=totals[1], cached_tokens=totals[2],
+        )
+        for model, totals in usage_totals.items()
+        if totals[0] or totals[1]
+    ]
 
     # Always record this subtask as processed, even with zero findings, so the
     # API can mark it "done" in the UI (an empty-findings event has no question).

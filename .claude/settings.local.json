@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(grep -E '\\\\.\\(py|tsx|ts\\)$')"
+      "Bash(grep -E '\\\\.\\(py|tsx|ts\\)$')",
+      "Bash(git -C /Users/jayden/Projects/multiagent-deep-research-system log --oneline)",
+      "Bash(git -C /Users/jayden/Projects/multiagent-deep-research-system diff web/app/page.tsx)",
+      "Bash(docker exec *)"
     ]
   }
 }

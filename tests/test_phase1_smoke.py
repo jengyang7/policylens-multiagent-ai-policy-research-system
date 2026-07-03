@@ -73,5 +73,12 @@ def test_subagent_input() -> None:
 
 def test_subagent_skips_video_sources_for_grounding_stability() -> None:
     assert _should_skip_source("https://www.youtube.com/watch?v=abc123")
+    assert _should_skip_source("https://m.youtube.com/watch?v=abc123")
     assert _should_skip_source("https://youtu.be/abc123")
     assert not _should_skip_source("https://www.copyright.gov/ai/")
+
+
+def test_subagent_skips_login_walled_linkedin_posts() -> None:
+    assert _should_skip_source("https://www.linkedin.com/posts/someone_activity-123")
+    assert _should_skip_source("https://sg.linkedin.com/pulse/some-article")
+    assert not _should_skip_source("https://www.imda.gov.sg/framework")

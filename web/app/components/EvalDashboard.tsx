@@ -49,6 +49,7 @@ interface EvalReportSummary extends RateCounts {
   eval_cost_usd: number;
   recall_score: number;
   relevance_score: number;
+  authority_score: number;
 }
 
 interface GroundingResult {
@@ -105,6 +106,21 @@ interface RelevanceResult {
   reasoning: string;
 }
 
+interface SourceAuthorityVerdict {
+  url: string;
+  domain: string;
+  tier: 'primary' | 'secondary' | 'other';
+  reasoning: string;
+}
+
+interface SourceAuthorityResult {
+  verdicts: SourceAuthorityVerdict[];
+  authority_score: number;
+  primary_count: number;
+  secondary_count: number;
+  other_count: number;
+}
+
 interface EvalReportDetail extends EvalReportSummary {
   report: {
     grounding_results: GroundingResult[];
@@ -113,6 +129,7 @@ interface EvalReportDetail extends EvalReportSummary {
     citation_coverage?: CitationCoverageResult;
     completeness: CompletenessResult;
     relevance: RelevanceResult;
+    source_authority?: SourceAuthorityResult; // absent on eval reports predating the metric
   };
 }
 
@@ -246,6 +263,9 @@ function buildEvalDetailMarkdown(detail: EvalReportDetail): string {
   lines.push(`| Citation faithfulness | ${fmtPct(faithfulness)} |`);
   lines.push(`| Completeness / recall | ${fmtPct(detail.recall_score * 100)} |`);
   lines.push(`| Relevance | ${fmtScore(detail.relevance_score)} |`);
+  if (detail.report.source_authority) {
+    lines.push(`| Source authority | ${fmtPct(detail.report.source_authority.authority_score * 100)} |`);
+  }
   lines.push(`| Unsupported findings | ${detail.ungrounded_count}/${detail.total_findings} |`);
   lines.push(`| Unfaithful citations | ${detail.unfaithful_count}/${detail.total_citations} |`);
   lines.push(`| Uncited sentences | ${detail.uncited_count} |`);
@@ -532,6 +552,35 @@ function DetailPanel({ detail, loading }: { detail: EvalReportDetail | null; loa
         </div>
       </div>
 
+      {/* Source authority (absent on eval reports predating the metric) */}
+      {detail.report.source_authority && (
+        <div>
+          <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-1.5">
+            Source Authority ({fmtPct(detail.report.source_authority.authority_score * 100)}
+            {' · '}{detail.report.source_authority.primary_count} primary
+            {' / '}{detail.report.source_authority.secondary_count} secondary
+            {' / '}{detail.report.source_authority.other_count} other)
+          </p>
+          <div className="space-y-1.5">
+            {detail.report.source_authority.verdicts.map((v, i) => (
+              <div key={i} className="flex items-start gap-2 bg-white border border-gray-200 rounded-lg px-3 py-2">
+                <span className={`flex-shrink-0 text-[10px] font-semibold rounded-full px-2 py-0.5 mt-0.5 ${
+                  v.tier === 'primary' ? 'bg-emerald-50 text-emerald-700'
+                  : v.tier === 'secondary' ? 'bg-blue-50 text-blue-700'
+                  : 'bg-amber-50 text-amber-700'
+                }`}>
+                  {v.tier}
+                </span>
+                <div className="min-w-0 flex-1">
+                  <p className="text-xs text-gray-700 truncate">{v.domain}</p>
+                  <p className="text-[10px] text-gray-400 mt-0.5">{v.reasoning}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Grounding results */}
       <div>
         <p className="text-[11px] uppercase tracking-wide text-gray-400 font-semibold mb-1.5">
@@ -735,6 +784,9 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
         const unfaithful = group.reports.reduce((s, r) => s + r.unfaithful_count, 0);
         const totalRecall = group.reports.reduce((s, r) => s + r.recall_score, 0);
         const totalRelevance = group.reports.reduce((s, r) => s + r.relevance_score, 0);
+        // Only average over reports that actually carry the metric (0 = pre-metric eval)
+        const authorityReports = group.reports.filter(r => r.authority_score > 0);
+        const totalAuthority = authorityReports.reduce((s, r) => s + r.authority_score, 0);
         const totalCost = group.runs.reduce((s, r) => s + (r.stats?.cost_usd ?? 0), 0);
         const totalLatency = group.runs.reduce((s, r) => s + (r.stats?.elapsed_seconds ?? 0), 0);
         return {
@@ -744,6 +796,7 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
           faithfulness: totalCitations === 0 ? null : ((totalCitations - unfaithful) / totalCitations) * 100,
           completeness: reportCount === 0 ? null : (totalRecall / reportCount) * 100,
           relevance: reportCount === 0 ? null : totalRelevance / reportCount,
+          authority: authorityReports.length === 0 ? null : (totalAuthority / authorityReports.length) * 100,
           avgCost: group.runs.length === 0 ? undefined : totalCost / group.runs.length,
           avgLatency: group.runs.length === 0 ? undefined : totalLatency / group.runs.length,
         };
@@ -767,12 +820,13 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
 
   function downloadBenchmarkMarkdown() {
     const lines = [
-      '| Mode | Runs | Grounding | Faithfulness | Completeness | Relevance | Avg Cost | Avg Latency |',
-      '|---|---:|---:|---:|---:|---:|---:|---:|',
+      '| Mode | Runs | Grounding | Faithfulness | Completeness | Relevance | Authority | Avg Cost | Avg Latency |',
+      '|---|---:|---:|---:|---:|---:|---:|---:|---:|',
       ...benchmarkRows.map(row => (
         `| ${modeLabel(row.mode)} | ${row.reports} | ${fmtPct(row.grounding)} | `
         + `${fmtPct(row.faithfulness)} | `
         + `${fmtPct(row.completeness)} | ${fmtScore(row.relevance)} | `
+        + `${fmtPct(row.authority)} | `
         + `${fmtCost(row.avgCost)} | `
         + `${row.avgLatency === undefined ? '—' : `${row.avgLatency.toFixed(1)}s`} |`
       )),
@@ -1250,6 +1304,7 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
                         <th className="text-right px-4 py-2 font-semibold">Faithfulness</th>
                         <th className="text-right px-4 py-2 font-semibold">Completeness</th>
                         <th className="text-right px-4 py-2 font-semibold">Relevance</th>
+                        <th className="text-right px-4 py-2 font-semibold">Authority</th>
                         <th className="text-right px-4 py-2 font-semibold">Avg Cost</th>
                         <th className="text-right px-4 py-2 font-semibold">Avg Latency</th>
                       </tr>
@@ -1265,6 +1320,7 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
                           <td className="px-4 py-2.5 text-right text-gray-500">{fmtPct(row.faithfulness)}</td>
                           <td className="px-4 py-2.5 text-right text-gray-500">{fmtPct(row.completeness)}</td>
                           <td className="px-4 py-2.5 text-right text-gray-500">{fmtScore(row.relevance)}</td>
+                          <td className="px-4 py-2.5 text-right text-gray-500">{fmtPct(row.authority)}</td>
                           <td className="px-4 py-2.5 text-right text-gray-500">{fmtCost(row.avgCost)}</td>
                           <td className="px-4 py-2.5 text-right text-gray-500">
                             {row.avgLatency === undefined ? '—' : `${row.avgLatency.toFixed(1)}s`}
@@ -1324,21 +1380,15 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
                 )}
               </div>
             </div>
-            {selectedRun && (
-              <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-gray-400">
-                <span>{modeLabel(selectedRun.stats?.mode)}</span>
-                <span>{fmtDate(selectedRun.started_at)}</span>
-                <span>{fmtCost(selectedRun.stats?.cost_usd)}</span>
-                <span>{selectedRun.stats?.elapsed_seconds !== undefined ? `${selectedRun.stats.elapsed_seconds}s` : '—'}</span>
-              </div>
-            )}
             {selectedRunEval && (
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-4">
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 mt-4">
                 {[
                   ['Grounding', fmtPct(groundingRate(selectedRunEval))],
                   ['Faithfulness', fmtPct(faithfulnessRate(selectedRunEval))],
                   ['Completeness', fmtPct(selectedRunEval.recall_score * 100)],
                   ['Relevance', fmtScore(selectedRunEval.relevance_score)],
+                  // 0 means "evaluated before the authority metric existed", not a real score
+                  ['Authority', selectedRunEval.authority_score > 0 ? fmtPct(selectedRunEval.authority_score * 100) : '—'],
                 ].map(([label, value]) => (
                   <div key={label} className="bg-gray-50 border border-gray-200 rounded-xl px-3 py-2">
                     <p className="text-[10px] uppercase tracking-wide text-gray-400 font-semibold">
@@ -1366,6 +1416,7 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
                       <th className="text-right px-4 py-2 font-semibold">Cost</th>
                       <th className="text-right px-4 py-2 font-semibold">Tokens</th>
                       <th className="text-right px-4 py-2 font-semibold">Elapsed</th>
+                      <th className="text-right px-4 py-2 font-semibold">Authority</th>
                       <th className="px-4 py-2"></th>
                     </tr>
                   </thead>
@@ -1385,6 +1436,9 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
                           <td className="px-4 py-2.5 text-right text-gray-500 whitespace-nowrap">{fmtCost(run.stats?.cost_usd)}</td>
                           <td className="px-4 py-2.5 text-right text-gray-500 whitespace-nowrap">{run.stats?.total_tokens?.toLocaleString() ?? '—'}</td>
                           <td className="px-4 py-2.5 text-right text-gray-500 whitespace-nowrap">{run.stats?.elapsed_seconds !== undefined ? `${run.stats.elapsed_seconds}s` : '—'}</td>
+                          <td className="px-4 py-2.5 text-right text-gray-500 whitespace-nowrap">
+                            {latest && latest.authority_score > 0 ? fmtPct(latest.authority_score * 100) : '—'}
+                          </td>
                           <td className="px-4 py-2.5 text-right whitespace-nowrap">
                             <div className="flex items-center justify-end gap-3">
                               {latest ? (
@@ -1420,6 +1474,25 @@ export default function EvalDashboard({ apiBase, clientId }: { apiBase: string; 
                 </table>
               </div>
             )}
+          </div>
+
+          {/* Metric definitions — what each eval score actually measures */}
+          <div className="bg-white border border-gray-200 rounded-2xl shadow-sm p-4">
+            <p className="text-sm font-semibold text-gray-900 mb-2">What the metrics measure</p>
+            <dl className="grid gap-x-6 gap-y-1.5 sm:grid-cols-2 text-xs">
+              {[
+                ['Grounding', 'Every finding’s quoted evidence is re-fetched from its source URL and matched against the live page — citations point at real text, checked without an LLM.'],
+                ['Faithfulness', 'An independent judge model verifies each cited report sentence against the findings behind its citation — the report doesn’t overstate its sources.'],
+                ['Completeness', 'The judge generates the subtopics a good answer should cover, then checks the report against them. The rubric is regenerated per eval, so scores vary a few points between evals of the same report.'],
+                ['Relevance', '1–5: does the report answer the question that was actually asked, rather than a nearby easier one.'],
+                ['Authority', 'Unique cited domains tiered primary (regulators, courts, standards bodies) / secondary (major law firms, news, academia) / other (vendor blogs, content sites), weighted 1.0/0.6/0.2. Complements grounding: a quote can be accurate but from a weak source.'],
+              ].map(([term, def]) => (
+                <div key={term} className="flex gap-2">
+                  <dt className="flex-shrink-0 w-24 font-semibold text-gray-600">{term}</dt>
+                  <dd className="text-gray-400">{def}</dd>
+                </div>
+              ))}
+            </dl>
           </div>
           </>
           )}

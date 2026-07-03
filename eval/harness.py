@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from engine.models import LEAD_MODEL, estimate_cost_usd
+from engine.models import EVAL_MODEL, estimate_cost_usd
 from engine.state import TokenUsage
 from eval.citation_coverage import run_citation_coverage_check
 from eval.completeness import run_completeness_check
@@ -20,10 +20,14 @@ from eval.grounding import run_grounding_checks
 from eval.loader import load_run
 from eval.relevance import run_relevance_check
 from eval.schema import EvalReport
+from eval.source_authority import run_source_authority_check
 
 
 async def evaluate_run(
-    run_id: str, lead_model: str = LEAD_MODEL, strict: bool = True
+    # Default judge = EVAL_MODEL (same fixed judge the dashboard uses), so CLI
+    # and dashboard eval numbers are apples-to-apples. A different provider
+    # than LEAD_MODEL by design — avoids self-preference bias.
+    run_id: str, lead_model: str = EVAL_MODEL, strict: bool = True
 ) -> EvalReport:
     """Load `run_id`, run grounding + faithfulness + completeness + relevance
     checks, and build an EvalReport.
@@ -50,6 +54,9 @@ async def evaluate_run(
     relevance_result, relevance_usage = await run_relevance_check(
         run_data.query, run_data.report, lead_model
     )
+    source_authority_result, source_authority_usage = await run_source_authority_check(
+        run_data.findings, lead_model
+    )
 
     ungrounded_count = sum(1 for g in grounding_results if not g.grounded)
     unfaithful_count = sum(1 for f in faithfulness_results if not f.faithful)
@@ -73,6 +80,7 @@ async def evaluate_run(
         *citation_coverage_usage,
         *completeness_usage,
         *([relevance_usage] if relevance_usage else []),
+        *([source_authority_usage] if source_authority_usage else []),
     ]
 
     return EvalReport(
@@ -85,6 +93,7 @@ async def evaluate_run(
         citation_coverage=citation_coverage,
         completeness=completeness_result,
         relevance=relevance_result,
+        source_authority=source_authority_result,
         total_findings=len(run_data.findings),
         ungrounded_count=ungrounded_count,
         unfaithful_count=unfaithful_count,

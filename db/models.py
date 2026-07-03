@@ -134,6 +134,9 @@ class EvalReportRecord(Base):
     # Completeness recall (covered/total subtopics) and relevance score (1-5).
     recall_score: Mapped[float] = mapped_column(Float, nullable=False, server_default="0")
     relevance_score: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    # Source authority: weighted mean over unique cited domains (0-1),
+    # primary 1.0 / secondary 0.6 / other 0.2 (eval/source_authority.py).
+    authority_score: Mapped[float] = mapped_column(Float, nullable=False, server_default="0")
     # Full eval.schema.EvalReport.model_dump() for the drill-down detail view.
     report: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
 

@@ -38,6 +38,7 @@ from eval.schema import (
     GroundingResult,
     RagAnswerRelevanceVerdict,
     RelevanceResult,
+    SourceAuthorityResult,
     SubtopicCoverage,
 )
 
@@ -576,6 +577,15 @@ def _fake_relevance_check():
     return fake
 
 
+def _fake_source_authority_check():
+    async def fake(findings, lead_model):
+        return SourceAuthorityResult(
+            verdicts=[], authority_score=0.0,
+            primary_count=0, secondary_count=0, other_count=0,
+        ), None
+    return fake
+
+
 def _fake_citation_coverage_check(
     uncited_factual_claims: int = 0,
 ):
@@ -628,6 +638,7 @@ async def test_evaluate_run_passes_when_all_grounded_and_faithful(monkeypatch) -
     monkeypatch.setattr("eval.harness.run_citation_coverage_check", _fake_citation_coverage_check())
     monkeypatch.setattr("eval.harness.run_completeness_check", _fake_completeness_check())
     monkeypatch.setattr("eval.harness.run_relevance_check", _fake_relevance_check())
+    monkeypatch.setattr("eval.harness.run_source_authority_check", _fake_source_authority_check())
 
     report = await evaluate_run("r1")
     assert report.passed
@@ -635,7 +646,9 @@ async def test_evaluate_run_passes_when_all_grounded_and_faithful(monkeypatch) -
     assert report.unfaithful_count == 0
     assert report.completeness.recall_score == 1.0
     assert report.relevance.score == 5
-    assert report.eval_model == "gpt-5.4"
+    # Default judge is the fixed EVAL_MODEL (dashboard parity), not LEAD_MODEL
+    from engine.models import EVAL_MODEL
+    assert report.eval_model == EVAL_MODEL
 
 
 async def test_evaluate_run_fails_on_ungrounded(monkeypatch) -> None:
@@ -661,6 +674,7 @@ async def test_evaluate_run_fails_on_ungrounded(monkeypatch) -> None:
     monkeypatch.setattr("eval.harness.run_citation_coverage_check", _fake_citation_coverage_check())
     monkeypatch.setattr("eval.harness.run_completeness_check", _fake_completeness_check())
     monkeypatch.setattr("eval.harness.run_relevance_check", _fake_relevance_check())
+    monkeypatch.setattr("eval.harness.run_source_authority_check", _fake_source_authority_check())
 
     report = await evaluate_run("r1")
     assert not report.passed
@@ -693,6 +707,7 @@ async def test_evaluate_run_strict_mode_fails_on_unfaithful(monkeypatch) -> None
     monkeypatch.setattr("eval.harness.run_citation_coverage_check", _fake_citation_coverage_check())
     monkeypatch.setattr("eval.harness.run_completeness_check", _fake_completeness_check())
     monkeypatch.setattr("eval.harness.run_relevance_check", _fake_relevance_check())
+    monkeypatch.setattr("eval.harness.run_source_authority_check", _fake_source_authority_check())
 
     lenient = await evaluate_run("r1", strict=False)
     assert lenient.passed  # 0 ungrounded -> passes even with an unfaithful citation
@@ -723,6 +738,7 @@ async def test_evaluate_run_strict_mode_fails_on_uncited_factual_claim(monkeypat
     )
     monkeypatch.setattr("eval.harness.run_completeness_check", _fake_completeness_check())
     monkeypatch.setattr("eval.harness.run_relevance_check", _fake_relevance_check())
+    monkeypatch.setattr("eval.harness.run_source_authority_check", _fake_source_authority_check())
 
     lenient = await evaluate_run("r1", strict=False)
     assert lenient.passed
@@ -730,3 +746,202 @@ async def test_evaluate_run_strict_mode_fails_on_uncited_factual_claim(monkeypat
     strict = await evaluate_run("r1", strict=True)
     assert not strict.passed
     assert "uncited factual" in strict.failure_reasons[0]
+
+
+# ---------------------------------------------------------------------------
+# verify_citations cleanup: headings whose section body was fully removed
+# ---------------------------------------------------------------------------
+
+def test_remove_empty_sections_drops_bare_headings() -> None:
+    from engine.nodes.verify_citations import _remove_empty_sections
+
+    body = (
+        "# Report Title\n\n"
+        "## Kept Section\n\nSome surviving sentence. [1]\n\n"
+        "## Emptied Section\n\n \n\n"
+        "## Another Kept Section\n\nMore text. [2]"
+    )
+    cleaned = _remove_empty_sections(body)
+    assert "## Emptied Section" not in cleaned
+    assert "## Kept Section" in cleaned
+    assert "## Another Kept Section" in cleaned
+    assert "# Report Title" in cleaned
+
+
+def test_remove_empty_sections_collapses_empty_parent_but_keeps_full_subtree() -> None:
+    from engine.nodes.verify_citations import _remove_empty_sections
+
+    body = (
+        "## Empty Parent\n\n### Empty Child\n\n\n"
+        "## Full Parent\n\n### Full Child\n\nContent survives here."
+    )
+    cleaned = _remove_empty_sections(body)
+    assert "## Empty Parent" not in cleaned
+    assert "### Empty Child" not in cleaned
+    assert "## Full Parent" in cleaned
+    assert "### Full Child" in cleaned
+    assert "Content survives here." in cleaned
+
+
+def test_cleanup_markdown_body_removes_sections_emptied_by_verification() -> None:
+    from engine.nodes.verify_citations import _cleanup_markdown_body
+
+    body = (
+        "## De Facto Enforcement and Regulatory Embedding\n\n \n\n"
+        "## Conclusion\n\nThe findings do not resolve the question. [1]"
+    )
+    cleaned = _cleanup_markdown_body(body)
+    assert "De Facto Enforcement" not in cleaned
+    assert "## Conclusion" in cleaned
+    assert "The findings do not resolve the question. [1]" in cleaned
+
+
+def test_normalize_report_spacing_repairs_sentences_but_preserves_abbreviations() -> None:
+    from engine.nodes.verify_citations import _normalize_report_spacing
+
+    # Missing sentence-boundary space is repaired…
+    assert _normalize_report_spacing("after harm.The next step") == "after harm. The next step"
+    assert _normalize_report_spacing("signed in 2026.The pact") == "signed in 2026. The pact"
+    # …but dotted abbreviations are left alone ("U.S." must not become "U. S.")
+    text = "bypass U.S. chip export restrictions"
+    assert _normalize_report_spacing(text) == text
+
+
+# ---------------------------------------------------------------------------
+# verify_citations coherence pass: deletion-only cleanup of stranded fragments
+# ---------------------------------------------------------------------------
+
+def _fake_coherence_chain(deletions: list[str]) -> object:
+    from unittest.mock import MagicMock
+
+    from engine.nodes.verify_citations import CoherenceEdits
+
+    raw_msg = MagicMock()
+    raw_msg.usage_metadata = None
+
+    class FakeChain:
+        async def ainvoke(self, inputs: dict[str, object]) -> dict[str, object]:
+            return {"raw": raw_msg, "parsed": CoherenceEdits(deletions=deletions)}
+
+    return FakeChain()
+
+
+async def test_coherence_pass_deletes_stranded_fragments_only(monkeypatch) -> None:
+    from engine.nodes.verify_citations import _remove_incoherent_remnants
+
+    body = (
+        "## Findings\n\n"
+        "On the other, some jurisdictions are stricter. "
+        "Singapore's framework is voluntary [1].\n\n"
+        "## Open Questions\n\nThe findings leave several issues unresolved."
+    )
+    monkeypatch.setattr(
+        "engine.nodes.verify_citations._coherence_chain",
+        lambda: _fake_coherence_chain([
+            "On the other, some jurisdictions are stricter.",
+            "The findings leave several issues unresolved.",
+            "This sentence was hallucinated and is not in the body.",
+            "## Findings",  # heading deletion must be refused
+        ]),
+    )
+
+    cleaned, usage = await _remove_incoherent_remnants(body)
+
+    assert "On the other" not in cleaned
+    assert "several issues unresolved" not in cleaned
+    assert "Singapore's framework is voluntary [1]." in cleaned
+    assert "## Findings" in cleaned
+    assert usage == []
+
+
+async def test_verify_citations_coherence_pass_drops_stub_and_emptied_heading(
+    monkeypatch,
+) -> None:
+    from engine.nodes.verify_citations import verify_citations
+
+    report = (
+        "## Analysis\n\nSupported claim [1]. Unsupported claim [1].\n\n"
+        "## Open Questions\n\nSeveral issues remain unresolved. Unsupported detail [1].\n\n"
+        "## References\n\n[1] [Source A](https://a.com)\n"
+    )
+
+    async def fake_faithfulness(report, findings, lead_model):
+        def verdict(sentence, faithful):
+            return FaithfulnessVerdict(
+                citation_index=1, report_sentence=sentence,
+                matched_finding_claims=["c"], faithful=faithful,
+                confidence=1.0, reasoning="r",
+            )
+        return (
+            [
+                verdict("Supported claim", True),
+                verdict("Unsupported claim", False),
+                verdict("Unsupported detail", False),
+            ],
+            [], [],
+        )
+
+    async def fake_coverage(report, lead_model):
+        return CitationCoverageResult(
+            coverage_score=1.0, cited_sentence_count=1, uncited_factual_claims=[]
+        ), []
+
+    monkeypatch.setattr("engine.nodes.verify_citations.run_faithfulness_checks", fake_faithfulness)
+    monkeypatch.setattr("engine.nodes.verify_citations.run_citation_coverage_check", fake_coverage)
+    # After removals, "Several issues remain unresolved." is a stranded lead-in;
+    # the coherence model nominates it for deletion, emptying its section.
+    monkeypatch.setattr(
+        "engine.nodes.verify_citations._coherence_chain",
+        lambda: _fake_coherence_chain(["Several issues remain unresolved."]),
+    )
+
+    result = await verify_citations(  # type: ignore[typeddict-item]
+        {"report": report, "findings": [_finding("evidence", "https://a.com")]}
+    )
+
+    verified = str(result["report"])
+    assert "Supported claim [1]." in verified
+    assert "Unsupported claim" not in verified
+    assert "unresolved" not in verified
+    assert "## Open Questions" not in verified  # emptied by coherence pass → heading dropped
+    assert "## Analysis" in verified
+
+
+async def test_verify_citations_remaps_finding_index_markers_to_source_numbers(
+    monkeypatch,
+) -> None:
+    """Debate-transcript markers cite per-finding indices (e.g. [3] of 3 findings
+    spanning 2 sources) — they must be remapped to canonical source numbers, and
+    markers resolving to nothing must be stripped, not shipped broken."""
+    from engine.nodes.verify_citations import verify_citations
+
+    findings = [
+        _finding("evidence", "https://a.com"),
+        _finding("evidence", "https://a.com"),
+        _finding("evidence", "https://b.com"),  # finding #3 → source [2]
+    ]
+    report = (
+        "Claim from source two [3]. Dangling claim [99].\n\n"
+        "## References\n\n[1] [Source A](https://a.com)\n\n[2] [Source B](https://b.com)\n"
+    )
+
+    async def fake_faithfulness(report, findings, lead_model):
+        return [], [], []
+
+    async def fake_coverage(report, lead_model):
+        return CitationCoverageResult(
+            coverage_score=1.0, cited_sentence_count=1, uncited_factual_claims=[]
+        ), []
+
+    monkeypatch.setattr("engine.nodes.verify_citations.run_faithfulness_checks", fake_faithfulness)
+    monkeypatch.setattr("engine.nodes.verify_citations.run_citation_coverage_check", fake_coverage)
+
+    result = await verify_citations(  # type: ignore[typeddict-item]
+        {"report": report, "findings": findings}
+    )
+
+    verified = str(result["report"])
+    assert "Claim from source two [2]." in verified  # finding #3 → its source's number
+    assert "[3]" not in verified
+    assert "[99]" not in verified  # unresolvable marker stripped
+    assert "Dangling claim ." not in verified or "[99]" not in verified

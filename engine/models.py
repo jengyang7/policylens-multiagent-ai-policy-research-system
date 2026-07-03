@@ -19,6 +19,12 @@ LEAD_MODEL = "gpt-5.4"
 # gpt-5.4-nano: $0.20/$1.25 per 1M tokens — supports cached input ($0.02)
 SUBAGENT_MODEL = "gpt-5.4-nano"
 
+# Per-page extraction escalation: nano is erratic on long real-world pages —
+# observed returning an empty FindingList on the official PDPC framework PDF
+# that mini extracted 11 findings from. When nano finds nothing on a page with
+# substantial content, that one page is retried on mini before being given up.
+SUBAGENT_ESCALATION_MODEL = "gpt-5.4-mini"
+
 # Per-sentence citation faithfulness judge: verify_citations node + eval harness
 # gpt-5.4-mini: $0.75/$4.50 per 1M tokens — supports cached input ($0.075)
 CITATION_CHECK_MODEL = "gpt-5.4-mini"
